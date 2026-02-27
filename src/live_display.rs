@@ -83,10 +83,11 @@ pub struct LiveDisplay {
     pub last_slice_time: Instant,
     pub buckets: Vec<TimeBucket>,
     pub spinner_idx: usize,
+    pub silent: bool,
 }
 
 impl LiveDisplay {
-    pub fn new(total_concurrent: usize, time_slice_secs: f64, lang: &str) -> Self {
+    pub fn new(total_concurrent: usize, time_slice_secs: f64, lang: &str, silent: bool) -> Self {
         let now = Instant::now();
         let mut requests = Vec::with_capacity(total_concurrent);
         for i in 0..total_concurrent {
@@ -101,6 +102,7 @@ impl LiveDisplay {
             last_slice_time: now,
             buckets: Vec::new(),
             spinner_idx: 0,
+            silent,
         }
     }
 
@@ -211,6 +213,9 @@ impl LiveDisplay {
 
     /// Render the live table to terminal
     fn render(&mut self, now: Instant) {
+        if self.silent {
+            return;
+        }
         let mut out = io::stdout();
 
         // Move cursor up to overwrite previous render
@@ -425,9 +430,11 @@ impl LiveDisplay {
         let now = Instant::now();
         // Collect any remaining bucket
         self.collect_bucket(now);
-        // Do one last render
-        self.render(now);
-        println!();
+        if !self.silent {
+            // Do one last render
+            self.render(now);
+            println!();
+        }
     }
 
     /// Collect final results from all requests

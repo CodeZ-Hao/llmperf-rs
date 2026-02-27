@@ -1,9 +1,10 @@
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::sync::OnceLock;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 
 /// Events emitted during streaming for real-time tracking
 #[derive(Debug, Clone)]
@@ -192,6 +193,11 @@ where
     }
 }
 
+/// Async helper: waits for stop notification (zero-latency wakeup)
+async fn wait_stop(notify: &Notify) {
+    notify.notified().await;
+}
+
 #[derive(Clone)]
 pub struct ApiClient {
     pub(crate) client: Client,
@@ -232,6 +238,7 @@ impl ApiClient {
         max_tokens: u32,
         prompt_tokens: u32,
         tx: mpsc::UnboundedSender<TokenEvent>,
+        stop_notify: Arc<Notify>,
     ) {
         let start = Instant::now();
 
@@ -300,9 +307,25 @@ impl ApiClient {
         let mut output_token_count: u32 = 0;
         let mut server_completion_tokens: Option<u32> = None;
 
-        while let Some(chunk) = stream.next().await {
+        loop {
+            let chunk = tokio::select! {
+                c = stream.next() => c,
+                _ = wait_stop(&stop_notify) => {
+                    let final_tokens = server_completion_tokens.unwrap_or(output_token_count);
+                    let _ = tx.send(TokenEvent::Completed {
+                        request_id,
+                        time: Instant::now(),
+                        completion_tokens: final_tokens,
+                        prompt_tokens,
+                        success: false,
+                        error: Some("interrupted".to_string()),
+                    });
+                    return;
+                }
+            };
+
             match chunk {
-                Ok(bytes) => {
+                Some(Ok(bytes)) => {
                     let now = Instant::now();
                     process_sse_buffer(&mut buffer, &bytes, |delta| {
                         if let Some(usage) = delta.usage {
@@ -333,7 +356,7 @@ impl ApiClient {
                         }
                     });
                 }
-                Err(e) => {
+                Some(Err(e)) => {
                     let _ = tx.send(TokenEvent::Completed {
                         request_id,
                         time: Instant::now(),
@@ -343,6 +366,10 @@ impl ApiClient {
                         error: Some(format!("Stream error: {}", e)),
                     });
                     return;
+                }
+                None => {
+                    // Stream ended normally
+                    break;
                 }
             }
         }

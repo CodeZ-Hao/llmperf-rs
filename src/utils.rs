@@ -5,13 +5,6 @@ pub fn display_width(s: &str) -> usize {
     UnicodeWidthStr::width(s)
 }
 
-/// Pad string to target display width (right-padded)
-pub fn pad_right(s: &str, width: usize) -> String {
-    let w = display_width(s);
-    if w >= width { return s.to_string(); }
-    format!("{}{}", s, " ".repeat(width - w))
-}
-
 /// Pad string to target display width (left-padded)
 pub fn pad_left(s: &str, width: usize) -> String {
     let w = display_width(s);
@@ -40,12 +33,6 @@ mod tests {
     #[test]
     fn test_display_width_cjk() {
         assert_eq!(display_width("你好"), 4);
-    }
-
-    #[test]
-    fn test_pad_right() {
-        assert_eq!(pad_right("hi", 6), "hi    ");
-        assert_eq!(pad_right("toolong", 3), "toolong");
     }
 
     #[test]

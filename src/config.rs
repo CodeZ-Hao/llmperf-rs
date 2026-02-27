@@ -1,8 +1,11 @@
 use serde::Deserialize;
 use std::fs;
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+
+/// System-wide default config path on Linux
+const SYSTEM_CONFIG_PATH: &str = "/etc/llmperf/config.yaml";
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
@@ -32,6 +35,7 @@ fn default_lang() -> String {
 pub struct CliOverrides {
     pub base_url: Option<String>,
     pub api_key: Option<String>,
+    pub config_explicit: bool,
 }
 
 impl Config {
@@ -43,14 +47,26 @@ impl Config {
         Ok(config)
     }
 
-    /// Resolve config with priority: CLI args > config.yaml > env vars.
-    /// When config.yaml doesn't exist:
+    /// Resolve config with priority: CLI args > ./config.yaml > /etc/llmperf/config.yaml > env vars.
+    /// When no config file exists:
     ///   - If CLI args provided, write them to config.yaml
     ///   - If env vars exist, prompt user with env var values as defaults
     ///   - Otherwise, prompt user interactively
     pub fn resolve(path: &Path, overrides: &CliOverrides) -> Result<Self, String> {
-        if path.exists() {
-            let mut config = Self::load(path)?;
+        // Try explicit path first, then fallback to /etc/llmperf/config.yaml
+        let resolved_path = if path.exists() {
+            path.to_path_buf()
+        } else {
+            let system_path = Path::new("/etc/llmperf/config.yaml");
+            if system_path.exists() {
+                system_path.to_path_buf()
+            } else {
+                path.to_path_buf() // will fall through to interactive setup
+            }
+        };
+
+        if resolved_path.exists() {
+            let mut config = Self::load(&resolved_path)?;
             // Apply CLI overrides on top of config file
             if let Some(url) = &overrides.base_url {
                 config.base_url = url.clone();
@@ -61,7 +77,14 @@ impl Config {
             return Ok(config);
         }
 
-        // Config file doesn't exist — check if CLI args are sufficient
+        // No config file found — determine save path
+        // If user explicitly specified --config, respect that; otherwise default to /etc/llmperf/
+        let save_path = if overrides.config_explicit {
+            path.to_path_buf()
+        } else {
+            PathBuf::from(SYSTEM_CONFIG_PATH)
+        };
+
         let env_base_url = std::env::var("OPENAI_BASE_URL").ok();
         let env_api_key = std::env::var("OPENAI_API_KEY").ok();
 
@@ -74,7 +97,8 @@ impl Config {
             let base_url = overrides.base_url.clone().unwrap();
             let api_key = overrides.api_key.clone().unwrap();
 
-            println!("\nConfiguration file not found: {}", path.display());
+            println!("\nConfiguration file not found");
+            println!("Will save to: {}", save_path.display());
             println!("\n=== Create New Configuration / 创建新配置文件 ===\n");
 
             print!("{} [default: gpt-4]: ",
@@ -110,13 +134,14 @@ impl Config {
                 lang: chosen_lang,
                 time_slice_interval: default_time_slice(),
             };
-            Self::write_config(path, &config)?;
+            Self::write_config(&save_path, &config)?;
             return Ok(config);
         }
 
         // Interactive setup — use env vars as defaults if available
         let detected_lang = detect_system_lang();
-        println!("\nConfiguration file not found: {}", path.display());
+        println!("\nConfiguration file not found");
+        println!("Will save to: {}", save_path.display());
         if has_env {
             if detected_lang == "zh" {
                 println!("检测到环境变量 OPENAI_BASE_URL / OPENAI_API_KEY，将作为默认值");
@@ -127,12 +152,12 @@ impl Config {
         println!("\n=== Create New Configuration / 创建新配置文件 ===\n");
 
         let config = Self::interactive_create(&detected_lang, &env_base_url, &env_api_key)?;
-        Self::write_config(path, &config)?;
+        Self::write_config(&save_path, &config)?;
 
         if detected_lang == "zh" {
-            println!("\n配置文件创建成功: {}", path.display());
+            println!("\n配置文件创建成功: {}", save_path.display());
         } else {
-            println!("\nConfiguration file created: {}", path.display());
+            println!("\nConfiguration file created: {}", save_path.display());
         }
         Ok(config)
     }
@@ -214,12 +239,19 @@ impl Config {
     }
 
     fn write_config(path: &Path, config: &Config) -> Result<(), String> {
+        // Auto-create parent directories if needed (e.g. /etc/llmperf/)
+        if let Some(parent) = path.parent() {
+            if !parent.exists() {
+                fs::create_dir_all(parent)
+                    .map_err(|e| format!("Failed to create directory {}: {}", parent.display(), e))?;
+            }
+        }
         let content = format!(
             "base_url: \"{}\"\napi_key: \"{}\"\ndefault_model: \"{}\"\nlang: \"{}\"\ntime_slice_interval: {}\n",
             config.base_url, config.api_key, config.default_model, config.lang, config.time_slice_interval
         );
         fs::write(path, content)
-            .map_err(|e| format!("Failed to write config file: {}", e))
+            .map_err(|e| format!("Failed to write config file {}: {}", path.display(), e))
     }
 }
 

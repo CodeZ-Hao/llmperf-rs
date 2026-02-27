@@ -2,9 +2,9 @@ use crate::client::{ApiClient, count_tokens};
 use crate::client::TokenEvent;
 use crate::live_display::{LiveDisplay, LiveTestResult};
 use rand::Rng;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
-use tokio::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::{mpsc, Notify};
 
 /// Run tests with live display and event-based streaming
 pub async fn run_live_test(
@@ -14,13 +14,15 @@ pub async fn run_live_test(
     max_tokens: u32,
     model: String,
     stop_flag: Arc<AtomicBool>,
+    stop_notify: Arc<Notify>,
     time_slice_secs: f64,
     lang: &str,
+    silent: bool,
 ) -> Vec<LiveTestResult> {
     let total_requests = context_sizes.len() * concurrent;
     let (tx, mut rx) = mpsc::unbounded_channel::<TokenEvent>();
 
-    let mut display = LiveDisplay::new(total_requests, time_slice_secs, lang);
+    let mut display = LiveDisplay::new(total_requests, time_slice_secs, lang, silent);
 
     // Spawn all request tasks
     let mut request_id = 0usize;
@@ -35,10 +37,11 @@ pub async fn run_live_test(
             let ctx = *context_size;
             let tx = tx.clone();
             let rid = request_id;
+            let sn = stop_notify.clone();
 
             tokio::spawn(async move {
                 let prompt = generate_random_prompt(ctx);
-                client.test_streaming_with_events(rid, &model, &prompt, max_tokens, ctx, tx).await;
+                client.test_streaming_with_events(rid, &model, &prompt, max_tokens, ctx, tx, sn).await;
             });
 
             request_id += 1;
@@ -51,11 +54,23 @@ pub async fn run_live_test(
     // Event loop: process events and tick display
     let tick_interval = std::time::Duration::from_millis(200);
     loop {
-        // Try to receive events with a timeout for ticking
+        // Check stop_flag every iteration
+        if stop_flag.load(Ordering::Relaxed) {
+            // Drain remaining buffered events before exiting
+            while let Ok(event) = rx.try_recv() {
+                display.process_event(event);
+            }
+            // Give tasks a moment to send their Completed events
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            while let Ok(event) = rx.try_recv() {
+                display.process_event(event);
+            }
+            break;
+        }
+
         match tokio::time::timeout(tick_interval, rx.recv()).await {
             Ok(Some(event)) => {
                 display.process_event(event);
-                // Drain any buffered events
                 while let Ok(event) = rx.try_recv() {
                     display.process_event(event);
                 }
@@ -69,9 +84,6 @@ pub async fn run_live_test(
             Err(_) => {
                 // Timeout - just tick the display
                 display.tick();
-                if stop_flag.load(Ordering::Relaxed) {
-                    break;
-                }
             }
         }
     }
