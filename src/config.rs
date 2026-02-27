@@ -69,14 +69,45 @@ impl Config {
         let has_env = env_base_url.is_some() && env_api_key.is_some();
 
         if has_cli_args {
-            // CLI args provided — write to config.yaml and use directly
+            // CLI args provided — still prompt for remaining config fields
+            let detected_lang = detect_system_lang();
             let base_url = overrides.base_url.clone().unwrap();
             let api_key = overrides.api_key.clone().unwrap();
+
+            println!("\nConfiguration file not found: {}", path.display());
+            println!("\n=== Create New Configuration / 创建新配置文件 ===\n");
+
+            print!("{} [default: gpt-4]: ",
+                if detected_lang == "zh" { "默认模型" } else { "Default Model" }
+            );
+            io::stdout().flush().unwrap();
+            let mut model = String::new();
+            io::stdin().read_line(&mut model).unwrap();
+            model = model.trim().to_string();
+            if model.is_empty() {
+                model = default_model();
+            }
+
+            print!("{} (zh/en) [default: {}]: ",
+                if detected_lang == "zh" { "语言" } else { "Language" },
+                detected_lang
+            );
+            io::stdout().flush().unwrap();
+            let mut chosen_lang = String::new();
+            io::stdin().read_line(&mut chosen_lang).unwrap();
+            chosen_lang = chosen_lang.trim().to_string();
+            if chosen_lang.is_empty() {
+                chosen_lang = detected_lang;
+            }
+            if chosen_lang != "zh" && chosen_lang != "en" {
+                chosen_lang = "en".to_string();
+            }
+
             let config = Config {
                 base_url,
                 api_key,
-                default_model: default_model(),
-                lang: detect_system_lang(),
+                default_model: model,
+                lang: chosen_lang,
                 time_slice_interval: default_time_slice(),
             };
             Self::write_config(path, &config)?;
@@ -184,8 +215,8 @@ impl Config {
 
     fn write_config(path: &Path, config: &Config) -> Result<(), String> {
         let content = format!(
-            "base_url: \"{}\"\napi_key: \"{}\"\ndefault_model: \"{}\"\nlang: \"{}\"\n",
-            config.base_url, config.api_key, config.default_model, config.lang
+            "base_url: \"{}\"\napi_key: \"{}\"\ndefault_model: \"{}\"\nlang: \"{}\"\ntime_slice_interval: {}\n",
+            config.base_url, config.api_key, config.default_model, config.lang, config.time_slice_interval
         );
         fs::write(path, content)
             .map_err(|e| format!("Failed to write config file: {}", e))

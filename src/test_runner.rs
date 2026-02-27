@@ -93,37 +93,40 @@ fn generate_random_prompt(target_tokens: u32) -> String {
     let mut rng = rand::thread_rng();
     let target = target_tokens as usize;
 
-    // Start with a rough estimate (most words are ~1 token, overshoot slightly)
-    let mut result = String::new();
+    // These short common words average ~1 token each (with space separator).
+    // Generate exactly target count of words as initial estimate.
+    let mut word_list: Vec<&str> = Vec::with_capacity(target + target / 10);
     for _ in 0..(target + target / 10) {
-        if !result.is_empty() {
+        word_list.push(words[rng.gen_range(0..words.len())]);
+    }
+    let mut result = word_list.join(" ");
+
+    // Single count to measure how far off we are
+    let actual = count_tokens(&result);
+
+    if actual > target {
+        // Overshot — binary search for the right truncation point by word boundary
+        // Find the approximate word index to truncate at
+        let ratio = target as f64 / actual as f64;
+        let mut end = (word_list.len() as f64 * ratio) as usize;
+        end = end.min(word_list.len());
+        result = word_list[..end].join(" ");
+
+        // Fine-tune: add words one at a time (very few iterations needed)
+        let mut current = count_tokens(&result);
+        while current < target && end < word_list.len() {
             result.push(' ');
+            result.push_str(word_list[end]);
+            end += 1;
+            current += 1; // ~1 token per word estimate, avoid re-counting full string
         }
-        result.push_str(words[rng.gen_range(0..words.len())]);
-    }
-
-    // Trim down if we overshot
-    loop {
-        let actual = count_tokens(&result);
-        if actual <= target {
-            break;
+    } else if actual < target {
+        // Undershot — append more words without re-counting the full string
+        let deficit = target - actual;
+        for _ in 0..deficit {
+            result.push(' ');
+            result.push_str(words[rng.gen_range(0..words.len())]);
         }
-        // Remove last word
-        if let Some(pos) = result.rfind(' ') {
-            result.truncate(pos);
-        } else {
-            break;
-        }
-    }
-
-    // Pad up if we undershot
-    loop {
-        let actual = count_tokens(&result);
-        if actual >= target {
-            break;
-        }
-        result.push(' ');
-        result.push_str(words[rng.gen_range(0..words.len())]);
     }
 
     result
