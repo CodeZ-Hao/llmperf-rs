@@ -3,7 +3,7 @@ use crate::client::TokenEvent;
 use crate::live_display::{LiveDisplay, LiveTestResult};
 use rand::Rng;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::sync::mpsc;
 
 /// Run tests with live display and event-based streaming
@@ -81,52 +81,48 @@ pub async fn run_live_test(
     display.collect_results()
 }
 
-fn generate_random_prompt(target_tokens: u32) -> String {
-    let words = [
-        "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
-        "the", "is", "at", "we", "be", "to", "of", "in", "it", "on", "that", "this",
-        "a", "an", "or", "and", "but", "for", "not", "with", "as", "can", "will",
-        "have", "has", "had", "were", "was", "are", "been", "being", "do", "does",
-        "did", "made", "from", "which", "their", "they", "them", "than", "then",
-    ];
+/// Pre-computed word token costs (word with leading space, as tiktoken sees it).
+/// Computed once via OnceLock to avoid repeated tiktoken calls.
+static WORD_TOKENS: OnceLock<Vec<(&'static str, usize)>> = OnceLock::new();
 
+const WORD_POOL: &[&str] = &[
+    "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+    "the", "is", "at", "we", "be", "to", "of", "in", "it", "on", "that", "this",
+    "a", "an", "or", "and", "but", "for", "not", "with", "as", "can", "will",
+    "have", "has", "had", "were", "was", "are", "been", "being", "do", "does",
+    "did", "made", "from", "which", "their", "they", "them", "than", "then",
+];
+
+fn get_word_tokens() -> &'static Vec<(&'static str, usize)> {
+    WORD_TOKENS.get_or_init(|| {
+        WORD_POOL.iter().map(|w| {
+            // Measure token cost of " word" (with leading space, as it appears in context)
+            let cost = count_tokens(&format!(" {}", w));
+            let cost = cost.max(1);
+            (*w, cost)
+        }).collect()
+    })
+}
+
+fn generate_random_prompt(target_tokens: u32) -> String {
+    let words = get_word_tokens();
     let mut rng = rand::thread_rng();
     let target = target_tokens as usize;
 
-    // These short common words average ~1 token each (with space separator).
-    // Generate exactly target count of words as initial estimate.
-    let mut word_list: Vec<&str> = Vec::with_capacity(target + target / 10);
-    for _ in 0..(target + target / 10) {
-        word_list.push(words[rng.gen_range(0..words.len())]);
-    }
-    let mut result = word_list.join(" ");
+    // Estimate average bytes per token for pre-allocation
+    let avg_word_len: usize = 4; // " xx " ~4 bytes per word
+    let mut result = String::with_capacity(target * avg_word_len);
+    let mut token_count: usize = 0;
 
-    // Single count to measure how far off we are
-    let actual = count_tokens(&result);
-
-    if actual > target {
-        // Overshot — binary search for the right truncation point by word boundary
-        // Find the approximate word index to truncate at
-        let ratio = target as f64 / actual as f64;
-        let mut end = (word_list.len() as f64 * ratio) as usize;
-        end = end.min(word_list.len());
-        result = word_list[..end].join(" ");
-
-        // Fine-tune: add words one at a time (very few iterations needed)
-        let mut current = count_tokens(&result);
-        while current < target && end < word_list.len() {
+    // First word has no leading space — its token cost may differ slightly,
+    // but for these short words the difference is negligible.
+    while token_count < target {
+        let (word, cost) = words[rng.gen_range(0..words.len())];
+        if !result.is_empty() {
             result.push(' ');
-            result.push_str(word_list[end]);
-            end += 1;
-            current += 1; // ~1 token per word estimate, avoid re-counting full string
         }
-    } else if actual < target {
-        // Undershot — append more words without re-counting the full string
-        let deficit = target - actual;
-        for _ in 0..deficit {
-            result.push(' ');
-            result.push_str(words[rng.gen_range(0..words.len())]);
-        }
+        result.push_str(word);
+        token_count += cost;
     }
 
     result
@@ -191,5 +187,18 @@ mod tests {
         // Should be within a small margin of the target
         assert!(actual >= 95 && actual <= 110,
             "Expected ~100 tokens, got {}", actual);
+    }
+
+    #[test]
+    fn test_generate_random_prompt_100k_performance() {
+        let start = std::time::Instant::now();
+        let prompt = generate_random_prompt(100_000);
+        let elapsed = start.elapsed();
+
+        let actual = count_tokens(&prompt);
+        println!("100K prompt: {} tokens generated in {:?}", actual, elapsed);
+
+        assert!(elapsed.as_secs_f64() < 1.0,
+            "100K prompt generation took {:?}, must be under 1s", elapsed);
     }
 }
