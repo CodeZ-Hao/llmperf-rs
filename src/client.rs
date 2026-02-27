@@ -230,9 +230,9 @@ impl ApiClient {
         model: &str,
         prompt: &str,
         max_tokens: u32,
+        prompt_tokens: u32,
         tx: mpsc::UnboundedSender<TokenEvent>,
     ) {
-        let prompt_tokens = count_tokens(prompt) as u32;
         let start = Instant::now();
 
         if tx.send(TokenEvent::RequestStarted {
@@ -369,13 +369,14 @@ impl ApiClient {
     where
         F: FnMut(&str),
     {
-        // Calculate prompt tokens before sending
+        // Compute prompt tokens via tiktoken for accuracy (chat context is typically small).
+        // Will be replaced by server-provided value if available.
         let prompt_text: String = messages
             .iter()
             .map(|m| m.content.as_str())
             .collect::<Vec<_>>()
             .join("\n");
-        let prompt_tokens = count_tokens(&prompt_text) as u32;
+        let local_prompt_tokens = count_tokens(&prompt_text) as u32;
 
         let request = ChatRequest {
             model: model.to_string(),
@@ -415,6 +416,7 @@ impl ApiClient {
         let mut last_token_time: Option<std::time::Duration> = None;
         let mut buffer = String::new();
         let mut server_completion_tokens: Option<u32> = None;
+        let mut server_prompt_tokens: Option<u32> = None;
 
         while let Some(chunk) = stream.next().await {
             let bytes = chunk.map_err(|e| e.to_string())?;
@@ -424,6 +426,9 @@ impl ApiClient {
                 if let Some(usage) = delta.usage {
                     if let Some(ct) = usage.completion_tokens {
                         server_completion_tokens = Some(ct);
+                    }
+                    if let Some(pt) = usage.prompt_tokens {
+                        server_prompt_tokens = Some(pt);
                     }
                 }
                 if let Some(content) = delta.content {
@@ -437,7 +442,9 @@ impl ApiClient {
             });
         }
 
-        // Use server-provided completion tokens if available
+        // Use server-provided tokens if available, otherwise estimate
+        let prompt_tokens = server_prompt_tokens
+            .unwrap_or(local_prompt_tokens);
         let output_tokens = server_completion_tokens
             .unwrap_or_else(|| (full_content.len() / 4) as u32);
 

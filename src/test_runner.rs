@@ -38,7 +38,7 @@ pub async fn run_live_test(
 
             tokio::spawn(async move {
                 let prompt = generate_random_prompt(ctx);
-                client.test_streaming_with_events(rid, &model, &prompt, max_tokens, tx).await;
+                client.test_streaming_with_events(rid, &model, &prompt, max_tokens, ctx, tx).await;
             });
 
             request_id += 1;
@@ -109,20 +109,77 @@ fn generate_random_prompt(target_tokens: u32) -> String {
     let mut rng = rand::thread_rng();
     let target = target_tokens as usize;
 
-    // Estimate average bytes per token for pre-allocation
-    let avg_word_len: usize = 4; // " xx " ~4 bytes per word
+    // Phase 1: fast assembly using pre-computed per-word token costs.
+    // Build the string directly, no intermediate Vec needed.
+    let avg_word_len: usize = 5; // " word" ~5 bytes average
     let mut result = String::with_capacity(target * avg_word_len);
-    let mut token_count: usize = 0;
+    let mut estimated_tokens: usize = 0;
 
-    // First word has no leading space — its token cost may differ slightly,
-    // but for these short words the difference is negligible.
-    while token_count < target {
+    while estimated_tokens < target {
         let (word, cost) = words[rng.gen_range(0..words.len())];
         if !result.is_empty() {
             result.push(' ');
         }
         result.push_str(word);
-        token_count += cost;
+        estimated_tokens += cost;
+    }
+
+    // Phase 2: verify accuracy on a small tail segment via tiktoken.
+    // The per-word costs are measured with leading space, so cumulative drift
+    // is small. We only need to check the last ~200 tokens worth of text
+    // to measure the actual drift and compensate.
+    let check_size = 200.min(target);
+    // Find the word boundary ~check_size words from the end
+    let tail_start = {
+        let mut spaces = 0;
+        let mut pos = result.len();
+        for (i, b) in result.bytes().rev().enumerate() {
+            if b == b' ' {
+                spaces += 1;
+                if spaces >= check_size {
+                    pos = result.len() - i;
+                    break;
+                }
+            }
+        }
+        pos
+    };
+
+    let tail = &result[tail_start..];
+    let tail_estimated: usize = tail.split_whitespace()
+        .map(|w| {
+            words.iter()
+                .find(|(word, _)| *word == w)
+                .map(|(_, c)| *c)
+                .unwrap_or(1)
+        })
+        .sum();
+    let tail_actual = count_tokens(tail);
+
+    // Extrapolate drift to full string
+    if tail_estimated > 0 {
+        let drift_ratio = tail_actual as f64 / tail_estimated as f64;
+        let corrected_total = (estimated_tokens as f64 * drift_ratio) as usize;
+
+        if corrected_total > target {
+            // Trim excess words from the end
+            let excess = corrected_total - target;
+            for _ in 0..excess {
+                if let Some(pos) = result.rfind(' ') {
+                    result.truncate(pos);
+                } else {
+                    break;
+                }
+            }
+        } else if corrected_total < target {
+            // Append more words
+            let deficit = target - corrected_total;
+            for _ in 0..deficit {
+                let (word, _) = words[rng.gen_range(0..words.len())];
+                result.push(' ');
+                result.push_str(word);
+            }
+        }
     }
 
     result
