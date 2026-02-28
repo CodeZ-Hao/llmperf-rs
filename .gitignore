@@ -1,6 +1,7 @@
 target/
 *.exe
 llm-api-tester
-llmperf
+llmperf-rs
 config.yaml
+*.yaml
 .worktrees/

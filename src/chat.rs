@@ -3,8 +3,8 @@ use crate::config::Config;
 use std::io::{self, Write};
 
 pub fn run_chat(config: Config, model: Option<String>, initial_prompt: Option<String>, max_tokens: u32) {
-    let model = model.unwrap_or(config.default_model);
-    let client = ApiClient::new(config.base_url, config.api_key);
+    let model = model.unwrap_or(config.model);
+    let client = ApiClient::new(config.base_url.unwrap(), config.api_key.unwrap());
     let lang = config.lang;
 
     let (help_cmd, help_clear, help_exit, help_error, lbl_user, lbl_ai,

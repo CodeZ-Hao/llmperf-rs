@@ -1,22 +1,55 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// System-wide default config path on Linux
-const SYSTEM_CONFIG_PATH: &str = "/etc/llmperf/config.yaml";
+const SYSTEM_CONFIG_PATH: &str = "/etc/llmperf-rs/llmperf-rs.yaml";
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Config {
-    pub base_url: String,
-    pub api_key: String,
-    #[serde(default = "default_model")]
-    pub default_model: String,
-    #[serde(default = "default_lang")]
+    pub base_url: Option<String>,
+    pub api_key: Option<String>,
+    #[serde(default = "default_model", alias = "default_model")]
+    pub model: String,
+    #[serde(skip)]
     pub lang: String,
     #[serde(default = "default_time_slice")]
     pub time_slice_interval: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test: Option<TestConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat: Option<ChatConfig>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default, PartialEq)]
+pub struct TestConfig {
+    pub concurrent: Option<usize>,
+    pub context: Option<String>,
+    pub max_tokens: Option<u32>,
+    pub env_monitor: Option<bool>,
+    pub time_slice: Option<f64>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default, PartialEq)]
+pub struct ChatConfig {
+    pub max_tokens: Option<u32>,
+    pub prompt: Option<String>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            base_url: None,
+            api_key: None,
+            model: default_model(),
+            lang: "en".to_string(),
+            time_slice_interval: default_time_slice(),
+            test: None,
+            chat: None,
+        }
+    }
 }
 
 fn default_time_slice() -> f64 {
@@ -27,240 +60,119 @@ fn default_model() -> String {
     "gpt-4".to_string()
 }
 
-fn default_lang() -> String {
-    "en".to_string()
-}
-
 /// CLI overrides for config values
 pub struct CliOverrides {
     pub base_url: Option<String>,
     pub api_key: Option<String>,
-    pub config_explicit: bool,
 }
 
 impl Config {
     pub fn load(path: &Path) -> Result<Self, String> {
         let content = fs::read_to_string(path)
             .map_err(|e| format!("Failed to read config file: {}", e))?;
-        let config: Config = serde_yaml::from_str(&content)
+        let mut config: Config = serde_yaml::from_str(&content)
             .map_err(|e| format!("Failed to parse config file: {}", e))?;
+        config.lang = detect_system_lang();
         Ok(config)
     }
 
-    /// Resolve config with priority: CLI args > ./config.yaml > /etc/llmperf/config.yaml > env vars.
-    /// When no config file exists:
-    ///   - If CLI args provided, write them to config.yaml
-    ///   - If env vars exist, prompt user with env var values as defaults
-    ///   - Otherwise, prompt user interactively
+    /// Resolve config: CLI/env (already merged by clap) > config file > interactive prompt.
     pub fn resolve(path: &Path, overrides: &CliOverrides) -> Result<Self, String> {
-        // Try explicit path first, then fallback to /etc/llmperf/config.yaml
         let resolved_path = if path.exists() {
-            path.to_path_buf()
+            Some(path.to_path_buf())
         } else {
-            let system_path = Path::new("/etc/llmperf/config.yaml");
-            if system_path.exists() {
-                system_path.to_path_buf()
-            } else {
-                path.to_path_buf() // will fall through to interactive setup
-            }
+            let system_path = Path::new(SYSTEM_CONFIG_PATH);
+            if system_path.exists() { Some(system_path.to_path_buf()) } else { None }
         };
 
-        if resolved_path.exists() {
-            let mut config = Self::load(&resolved_path)?;
-            // Apply CLI overrides on top of config file
-            if let Some(url) = &overrides.base_url {
-                config.base_url = url.clone();
-            }
-            if let Some(key) = &overrides.api_key {
-                config.api_key = key.clone();
-            }
-            return Ok(config);
-        }
-
-        // No config file found — determine save path
-        // If user explicitly specified --config, respect that; otherwise default to /etc/llmperf/
-        let save_path = if overrides.config_explicit {
-            path.to_path_buf()
+        let mut config = if let Some(p) = &resolved_path {
+            Self::load(p)?
         } else {
-            PathBuf::from(SYSTEM_CONFIG_PATH)
+            let mut c = Config::default();
+            c.lang = detect_system_lang();
+            c
         };
 
-        let env_base_url = std::env::var("OPENAI_BASE_URL").ok();
-        let env_api_key = std::env::var("OPENAI_API_KEY").ok();
-
-        let has_cli_args = overrides.base_url.is_some() && overrides.api_key.is_some();
-        let has_env = env_base_url.is_some() && env_api_key.is_some();
-
-        if has_cli_args {
-            // CLI args provided — still prompt for remaining config fields
-            let detected_lang = detect_system_lang();
-            let base_url = overrides.base_url.clone().unwrap();
-            let api_key = overrides.api_key.clone().unwrap();
-
-            println!("\nConfiguration file not found");
-            println!("Will save to: {}", save_path.display());
-            println!("\n=== Create New Configuration / 创建新配置文件 ===\n");
-
-            print!("{} [default: gpt-4]: ",
-                if detected_lang == "zh" { "默认模型" } else { "Default Model" }
-            );
-            io::stdout().flush().unwrap();
-            let mut model = String::new();
-            io::stdin().read_line(&mut model).unwrap();
-            model = model.trim().to_string();
-            if model.is_empty() {
-                model = default_model();
-            }
-
-            print!("{} (zh/en) [default: {}]: ",
-                if detected_lang == "zh" { "语言" } else { "Language" },
-                detected_lang
-            );
-            io::stdout().flush().unwrap();
-            let mut chosen_lang = String::new();
-            io::stdin().read_line(&mut chosen_lang).unwrap();
-            chosen_lang = chosen_lang.trim().to_string();
-            if chosen_lang.is_empty() {
-                chosen_lang = detected_lang;
-            }
-            if chosen_lang != "zh" && chosen_lang != "en" {
-                chosen_lang = "en".to_string();
-            }
-
-            let config = Config {
-                base_url,
-                api_key,
-                default_model: model,
-                lang: chosen_lang,
-                time_slice_interval: default_time_slice(),
-            };
-            Self::write_config(&save_path, &config)?;
-            return Ok(config);
+        // CLI/env overrides take priority over config file
+        if let Some(url) = &overrides.base_url {
+            config.base_url = Some(url.clone());
+        }
+        if let Some(key) = &overrides.api_key {
+            config.api_key = Some(key.clone());
         }
 
-        // Interactive setup — use env vars as defaults if available
-        let detected_lang = detect_system_lang();
-        println!("\nConfiguration file not found");
-        println!("Will save to: {}", save_path.display());
-        if has_env {
-            if detected_lang == "zh" {
-                println!("检测到环境变量 OPENAI_BASE_URL / OPENAI_API_KEY，将作为默认值");
-            } else {
-                println!("Detected OPENAI_BASE_URL / OPENAI_API_KEY env vars, using as defaults");
-            }
+        // If still missing credentials, prompt interactively
+        if config.base_url.is_none() || config.api_key.is_none() {
+            Self::prompt_credentials(&mut config)?;
+            Self::ask_save_config(&config)?;
         }
-        println!("\n=== Create New Configuration / 创建新配置文件 ===\n");
 
-        let config = Self::interactive_create(&detected_lang, &env_base_url, &env_api_key)?;
-        Self::write_config(&save_path, &config)?;
-
-        if detected_lang == "zh" {
-            println!("\n配置文件创建成功: {}", save_path.display());
-        } else {
-            println!("\nConfiguration file created: {}", save_path.display());
-        }
         Ok(config)
     }
 
-    fn interactive_create(
-        lang: &str,
-        env_base_url: &Option<String>,
-        env_api_key: &Option<String>,
-    ) -> Result<Self, String> {
-        let default_url = env_base_url
-            .as_deref()
-            .unwrap_or("https://api.openai.com/v1");
-
-        print!("{} [default: {}]: ",
-            if lang == "zh" { "API 地址" } else { "Base URL" },
-            default_url
-        );
-        io::stdout().flush().unwrap();
-        let mut base_url = String::new();
-        io::stdin().read_line(&mut base_url).unwrap();
-        base_url = base_url.trim().to_string();
-        if base_url.is_empty() {
-            base_url = default_url.to_string();
+    fn prompt_credentials(config: &mut Config) -> Result<(), String> {
+        let lang = &config.lang;
+        if config.base_url.is_none() {
+            let default_url = "https://api.openai.com/v1";
+            print!("{} [default: {}]: ",
+                if lang == "zh" { "API 地址" } else { "Base URL" }, default_url);
+            io::stdout().flush().unwrap();
+            let mut input = String::new();
+            io::stdin().read_line(&mut input).unwrap();
+            let input = input.trim();
+            config.base_url = Some(if input.is_empty() { default_url.to_string() } else { input.to_string() });
         }
-
-        // API key — use env var as default if available
-        if let Some(env_key) = env_api_key {
-            let masked = mask_key(env_key);
-            print!("API Key [default: {}]: ", masked);
-        } else {
+        if config.api_key.is_none() {
             print!("API Key: ");
-        }
-        io::stdout().flush().unwrap();
-        let mut api_key = String::new();
-        io::stdin().read_line(&mut api_key).unwrap();
-        api_key = api_key.trim().to_string();
-        if api_key.is_empty() {
-            if let Some(env_key) = env_api_key {
-                api_key = env_key.clone();
-            } else {
+            io::stdout().flush().unwrap();
+            let mut input = String::new();
+            io::stdin().read_line(&mut input).unwrap();
+            let input = input.trim().to_string();
+            if input.is_empty() {
                 let msg = if lang == "zh" { "API Key 不能为空" } else { "API Key is required" };
                 return Err(msg.to_string());
             }
+            config.api_key = Some(input);
         }
-
-        print!("{} [default: gpt-4]: ",
-            if lang == "zh" { "默认模型" } else { "Default Model" }
-        );
-        io::stdout().flush().unwrap();
-        let mut model = String::new();
-        io::stdin().read_line(&mut model).unwrap();
-        model = model.trim().to_string();
-        if model.is_empty() {
-            model = default_model();
-        }
-
-        print!("{} (zh/en) [default: {}]: ",
-            if lang == "zh" { "语言" } else { "Language" },
-            lang
-        );
-        io::stdout().flush().unwrap();
-        let mut chosen_lang = String::new();
-        io::stdin().read_line(&mut chosen_lang).unwrap();
-        chosen_lang = chosen_lang.trim().to_string();
-        if chosen_lang.is_empty() {
-            chosen_lang = lang.to_string();
-        }
-        if chosen_lang != "zh" && chosen_lang != "en" {
-            chosen_lang = "en".to_string();
-        }
-
-        Ok(Config {
-            base_url,
-            api_key,
-            default_model: model,
-            lang: chosen_lang,
-            time_slice_interval: default_time_slice(),
-        })
+        Ok(())
     }
 
-    fn write_config(path: &Path, config: &Config) -> Result<(), String> {
-        // Auto-create parent directories if needed (e.g. /etc/llmperf/)
+    fn ask_save_config(config: &Config) -> Result<(), String> {
+        let prompt = if config.lang == "zh" { "是否保存配置文件? (y/N): " } else { "Save config file? (y/N): " };
+        print!("{}", prompt);
+        io::stdout().flush().unwrap();
+        let mut input = String::new();
+        io::stdin().read_line(&mut input).unwrap();
+        if input.trim().eq_ignore_ascii_case("y") {
+            let default_path = PathBuf::from("llmperf-rs.yaml");
+            print!("{} [default: {}]: ",
+                if config.lang == "zh" { "保存路径" } else { "Save path" },
+                default_path.display());
+            io::stdout().flush().unwrap();
+            let mut path_input = String::new();
+            io::stdin().read_line(&mut path_input).unwrap();
+            let path_input = path_input.trim();
+            let save_path = if path_input.is_empty() { default_path } else { PathBuf::from(path_input) };
+            Self::write_config(&save_path, config)?;
+            println!("{}: {}",
+                if config.lang == "zh" { "配置文件已保存" } else { "Config saved" },
+                save_path.display());
+        }
+        Ok(())
+    }
+
+    pub fn write_config(path: &Path, config: &Config) -> Result<(), String> {
         if let Some(parent) = path.parent() {
             if !parent.exists() {
                 fs::create_dir_all(parent)
                     .map_err(|e| format!("Failed to create directory {}: {}", parent.display(), e))?;
             }
         }
-        let content = format!(
-            "base_url: \"{}\"\napi_key: \"{}\"\ndefault_model: \"{}\"\nlang: \"{}\"\ntime_slice_interval: {}\n",
-            config.base_url, config.api_key, config.default_model, config.lang, config.time_slice_interval
-        );
+        let content = serde_yaml::to_string(config)
+            .map_err(|e| format!("Failed to serialize config: {}", e))?;
         fs::write(path, content)
             .map_err(|e| format!("Failed to write config file {}: {}", path.display(), e))
     }
-}
-
-/// Mask an API key for display: show first 6 and last 4 chars
-fn mask_key(key: &str) -> String {
-    if key.len() <= 10 {
-        return "****".to_string();
-    }
-    format!("{}...{}", &key[..6], &key[key.len()-4..])
 }
 
 /// Detect system default language
@@ -321,18 +233,94 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_mask_key_long() {
-        assert_eq!(mask_key("sk-abcdef1234567890"), "sk-abc...7890");
+    fn test_config_serialization() {
+        let config = Config {
+            base_url: Some("https://api.example.com/v1".to_string()),
+            api_key: Some("sk-test123".to_string()),
+            model: "gpt-4".to_string(),
+            lang: "en".to_string(),
+            time_slice_interval: 3.0,
+            test: Some(TestConfig {
+                concurrent: Some(4),
+                context: Some("4096".to_string()),
+                max_tokens: Some(128),
+                env_monitor: Some(false),
+                time_slice: None,
+            }),
+            chat: Some(ChatConfig {
+                max_tokens: Some(1024),
+                prompt: Some("hello".to_string()),
+            }),
+        };
+
+        let yaml = serde_yaml::to_string(&config).unwrap();
+        assert!(yaml.contains("base_url: https://api.example.com/v1"));
+        assert!(yaml.contains("concurrent: 4"));
+        assert!(yaml.contains("prompt: hello"));
     }
 
     #[test]
-    fn test_mask_key_short() {
-        assert_eq!(mask_key("short"), "****");
-        assert_eq!(mask_key("1234567890"), "****");
+    fn test_config_deserialization() {
+        let yaml = r#"
+base_url: "https://api.example.com/v1"
+api_key: "sk-test123"
+model: "gpt-4"
+time_slice_interval: 3.0
+
+test:
+  concurrent: 4
+  context: "4096"
+  max_tokens: 128
+
+chat:
+  max_tokens: 1024
+  prompt: "hello"
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+
+        assert_eq!(config.base_url, Some("https://api.example.com/v1".to_string()));
+        assert_eq!(config.api_key, Some("sk-test123".to_string()));
+        assert_eq!(config.model, "gpt-4");
+
+        let test_config = config.test.unwrap();
+        assert_eq!(test_config.concurrent, Some(4));
+        assert_eq!(test_config.context, Some("4096".to_string()));
+        assert_eq!(test_config.max_tokens, Some(128));
+
+        let chat_config = config.chat.unwrap();
+        assert_eq!(chat_config.max_tokens, Some(1024));
+        assert_eq!(chat_config.prompt, Some("hello".to_string()));
     }
 
     #[test]
-    fn test_mask_key_empty() {
-        assert_eq!(mask_key(""), "****");
+    fn test_config_partial_fields() {
+        let yaml = r#"
+base_url: "https://api.example.com/v1"
+api_key: "sk-test123"
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+
+        assert_eq!(config.base_url, Some("https://api.example.com/v1".to_string()));
+        assert_eq!(config.api_key, Some("sk-test123".to_string()));
+        assert_eq!(config.model, "gpt-4"); // default
+        assert_eq!(config.test, None);
+        assert_eq!(config.chat, None);
+    }
+
+    #[test]
+    fn test_chat_config_only() {
+        let yaml = r#"
+base_url: "https://api.example.com/v1"
+api_key: "sk-test123"
+
+chat:
+  prompt: "test prompt"
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+
+        assert!(config.test.is_none());
+        assert!(config.chat.is_some());
+        assert_eq!(config.chat.as_ref().unwrap().prompt, Some("test prompt".to_string()));
     }
 }
+

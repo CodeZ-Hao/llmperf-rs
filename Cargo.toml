@@ -1,12 +1,12 @@
 [package]
-name = "llmperf"
+name = "llmperf-rs"
 version = "0.1.0"
 edition = "2021"
 description = "LLM API performance testing CLI tool"
 license = "MIT"
 
 [[bin]]
-name = "llmperf"
+name = "llmperf-rs"
 path = "src/main.rs"
 
 [dependencies]
