@@ -3,6 +3,7 @@
 > ⚠️ **此项目由 AI 生成**，作者测试并验证了在 Windows 以及 Ubuntu 环境下的可用性
 
 LLM API Testing CLI Tool - 用于测试 LLM API 性能的命令行工具。
+支持并发测试最大输出，支持json格式输出，支持通过配置文件快速测试，支持直接chat测试，适合在无用户界面或ssh环境下使用，也很适合在CI流程中使用。
 
 > 📖 [English README](./README_en.md)
 
@@ -133,7 +134,7 @@ llmperf-rs test [OPTIONS]
 # 默认测试
 llmperf-rs test
 
-# 4 并发，多上下文大小
+# 4 并发，依次测试1024、2048、3072、4096 4段上下文长度下数据
 llmperf-rs test -j 4 -c 1024:1024:4096
 
 # 指定模型和 API 地址
