@@ -1,8 +1,6 @@
 # llmperf-rs
 
-> ⚠️ **This project is AI-generated**
-
-LLM API Testing CLI Tool - A command-line tool for testing LLM API performance.
+> ⚠️ **This project is AI-generated**, and the author has tested and verified its usability on Windows and Ubuntu.
 
 ## Features
 

@@ -1,8 +1,10 @@
 # llmperf-rs
 
-> ⚠️ **此项目由 AI 生成**
+> ⚠️ **此项目由 AI 生成**，作者测试并验证了在 Windows 以及 Ubuntu 环境下的可用性
 
 LLM API Testing CLI Tool - 用于测试 LLM API 性能的命令行工具。
+
+> 📖 [English README](./README_en.md)
 
 ## 功能特性
 
