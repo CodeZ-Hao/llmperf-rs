@@ -212,7 +212,7 @@ During test run, the terminal displays a real-time status table for each request
 
 ### Final Statistics
 
-After test completes, outputs system-level throughput (total tokens / wall clock time), not per-request average.
+After test completes, outputs system total throughput. For overlapping outputs, tokens are counted multiple times; for non-overlapping parts, they are counted separately. System total throughput = total tokens / wall clock time. This approach accurately reflects the actual throughput capabilities of both prefill and decode phases.
 
 ## License
 
