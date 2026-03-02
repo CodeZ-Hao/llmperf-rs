@@ -2,6 +2,11 @@
 
 > ⚠️ **This project is AI-generated**, and the author has tested and verified its usability on Windows and Ubuntu.
 
+LLM API Testing CLI Tool - A command-line tool for testing LLM API performance.
+Supports concurrent testing with maximum output, JSON format output, quick testing via config files, and direct chat testing. Suitable for use in headless or SSH environments, as well as in CI/CD pipelines.
+
+> 📖 [中文 README](./README.md)
+
 ## Features
 
 - Support for OpenAI API-compatible LLM API testing
@@ -129,7 +134,7 @@ llmperf-rs test [OPTIONS]
 # Default test
 llmperf-rs test
 
-# 4 concurrent, multiple context sizes
+# 4 concurrent, test 1024, 2048, 3072, 4096 context sizes sequentially
 llmperf-rs test -j 4 -c 1024:1024:4096
 
 # Specify model and API URL
