@@ -1,5 +1,7 @@
 # llmperf-rs
 
+> ⚠️ **此项目由 AI 生成**
+
 LLM API Testing CLI Tool - 用于测试 LLM API 性能的命令行工具。
 
 ## 功能特性
