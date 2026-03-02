@@ -41,8 +41,18 @@ jobs:
           toolchain: stable
           targets: ${{ matrix.target }}
 
-      - name: Build release
+      - name: Install cross compile tools
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Build release
+        shell: bash
+        run: |
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+          fi
           cargo build --release --locked --target ${{ matrix.target }}
           if [ "${{ matrix.os }}" = "windows-latest" ]; then
             mv target/${{ matrix.target }}/release/llmperf-rs.exe ${{ matrix.artifact }}
