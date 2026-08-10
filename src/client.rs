@@ -216,11 +216,13 @@ pub struct ChatStreamResult {
 }
 
 impl ApiClient {
-    pub fn new(base_url: String, api_key: String) -> Self {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(300))
-            .build()
-            .expect("Failed to build HTTP client");
+    /// `timeout`: None = no limit (reqwest default)
+    pub fn new(base_url: String, api_key: String, timeout: Option<Duration>) -> Self {
+        let mut builder = Client::builder();
+        if let Some(t) = timeout {
+            builder = builder.timeout(t);
+        }
+        let client = builder.build().expect("Failed to build HTTP client");
 
         Self {
             client,

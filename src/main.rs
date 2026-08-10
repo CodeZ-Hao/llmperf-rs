@@ -14,6 +14,7 @@ use env_monitor::EnvMonitor;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Notify;
 
 #[derive(Parser, Debug)]
@@ -43,6 +44,10 @@ struct Cli {
     /// Override system language detection (zh/en)
     #[arg(long)]
     lang: Option<String>,
+
+    /// Request timeout in seconds (default: no limit)
+    #[arg(long)]
+    timeout: Option<u64>,
 
     /// Save current effective config to file and exit
     #[arg(long, value_hint = ValueHint::FilePath)]
@@ -98,6 +103,10 @@ enum Commands {
         #[arg(long)]
         lang: Option<String>,
 
+        /// Request timeout in seconds (overrides base --timeout, default: no limit)
+        #[arg(long)]
+        timeout: Option<u64>,
+
         /// Save current effective config to file and exit
         #[arg(long, value_hint = ValueHint::FilePath)]
         save_config: Option<PathBuf>,
@@ -135,6 +144,10 @@ enum Commands {
         #[arg(long)]
         lang: Option<String>,
 
+        /// Request timeout in seconds (overrides base --timeout, default: no limit)
+        #[arg(long)]
+        timeout: Option<u64>,
+
         /// Save current effective config to file and exit
         #[arg(long, value_hint = ValueHint::FilePath)]
         save_config: Option<PathBuf>,
@@ -146,14 +159,14 @@ fn main() {
     let cli = Cli::from_arg_matches(&matches).expect("Failed to parse CLI args");
 
     // Extract subcommand-level overrides (inherit: subcommand > base)
-    let (sub_base_url, sub_api_key, sub_model, sub_json, sub_lang, sub_save_config) = match &cli.command {
-        Some(Commands::Test { base_url, api_key, model, json, lang, save_config, .. }) => {
-            (base_url.clone(), api_key.clone(), model.clone(), *json, lang.clone(), save_config.clone())
+    let (sub_base_url, sub_api_key, sub_model, sub_json, sub_lang, sub_save_config, sub_timeout) = match &cli.command {
+        Some(Commands::Test { base_url, api_key, model, json, lang, save_config, timeout, .. }) => {
+            (base_url.clone(), api_key.clone(), model.clone(), *json, lang.clone(), save_config.clone(), *timeout)
         }
-        Some(Commands::Chat { base_url, api_key, model, json, lang, save_config, .. }) => {
-            (base_url.clone(), api_key.clone(), model.clone(), *json, lang.clone(), save_config.clone())
+        Some(Commands::Chat { base_url, api_key, model, json, lang, save_config, timeout, .. }) => {
+            (base_url.clone(), api_key.clone(), model.clone(), *json, lang.clone(), save_config.clone(), *timeout)
         }
-        None => (None, None, None, false, None, None),
+        None => (None, None, None, false, None, None, None),
     };
 
     let effective_base_url = sub_base_url.or(cli.base_url);
@@ -162,6 +175,7 @@ fn main() {
     let effective_json = sub_json || cli.json;
     let effective_lang = sub_lang.or(cli.lang);
     let effective_save_config = sub_save_config.or(cli.save_config);
+    let effective_timeout = sub_timeout.or(cli.timeout);
 
     let overrides = CliOverrides {
         base_url: effective_base_url.clone(),
@@ -184,6 +198,11 @@ fn main() {
     // Apply model override from CLI
     if let Some(m) = &effective_model {
         config.model = m.clone();
+    }
+
+    // Apply timeout override from CLI
+    if let Some(t) = effective_timeout {
+        config.timeout = Some(t);
     }
 
     // Merge config file defaults into subcommand params via value_source
@@ -358,7 +377,11 @@ fn run_tests(
         .expect("API base URL is required (set via --base-url, config file, or environment variable)");
     let api_key = config.api_key.as_ref()
         .expect("API key is required (set via --api-key, config file, or environment variable)");
-    let client = ApiClient::new(base_url.clone(), api_key.clone());
+    let client = ApiClient::new(
+        base_url.clone(),
+        api_key.clone(),
+        config.timeout.map(Duration::from_secs),
+    );
 
     // Run tests with live display (suppressed in JSON mode)
     let runtime = tokio::runtime::Runtime::new().expect("Failed to create runtime");

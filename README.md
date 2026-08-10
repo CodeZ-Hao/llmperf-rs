@@ -56,6 +56,7 @@ cargo build --release
 | `model` | String | 否 | `gpt-4` | 默认模型 (也支持 `default_model`) |
 | `lang` | String | 否 | `en` | 输出语言 `zh` / `en` |
 | `time_slice_interval` | Float | 否 | `3.0` | 时间片采样间隔（秒） |
+| `timeout` | Integer | 否 | 无 | 请求超时时间（秒），不设置则不限制 |
 
 #### test 子配置
 
@@ -103,6 +104,7 @@ chat:
 --api-key <KEY>          API 密钥 (覆盖配置文件，env: OPENAI_API_KEY)
 --json                   以 JSON 格式输出结果（抑制进度显示）
 --lang <LANG>            输出语言 (zh/en)，覆盖自动检测
+--timeout <SECONDS>      请求超时时间（秒），默认不限制
 --save-config <FILE>     保存当前配置到文件并退出
 ```
 
@@ -124,6 +126,7 @@ llmperf-rs test [OPTIONS]
 | `--model <MODEL>` | `-m` | 配置文件默认值 | 测试模型 |
 | `--env-monitor` | `-e` | `false` | 输出环境信息 |
 | `--time-slice <SECS>` | - | `3.0` | 时间片采样间隔（秒） |
+| `--timeout <SECONDS>` | - | 不限制 | 请求超时时间（秒） |
 | `--json` | - | `false` | 以 JSON 格式输出结果 |
 | `--lang <LANG>` | - | 自动检测 | 输出语言 (zh/en) |
 | `--save-config <FILE>` | - | - | 保存当前配置到文件并退出 |
@@ -166,6 +169,7 @@ llmperf-rs chat [OPTIONS]
 | `--model <MODEL>` | `-m` | 配置文件默认值 | 聊天模型 |
 | `--prompt <TEXT>` | `-p` | - | 初始 prompt，支持 `@filepath` 从文件读取 |
 | `--max-tokens <NUM>` | - | `1024` | 每次回复最大 token 数 |
+| `--timeout <SECONDS>` | - | 不限制 | 请求超时时间（秒） |
 | `--lang <LANG>` | - | 自动检测 | 输出语言 (zh/en) |
 | `--save-config <FILE>` | - | - | 保存当前配置到文件并退出 |
 

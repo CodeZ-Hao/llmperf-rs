@@ -17,6 +17,9 @@ pub struct Config {
     pub lang: String,
     #[serde(default = "default_time_slice")]
     pub time_slice_interval: f64,
+    /// Request timeout in seconds (None = no limit)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub test: Option<TestConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -46,6 +49,7 @@ impl Default for Config {
             model: default_model(),
             lang: "en".to_string(),
             time_slice_interval: default_time_slice(),
+            timeout: None,
             test: None,
             chat: None,
         }
@@ -240,6 +244,7 @@ mod tests {
             model: "gpt-4".to_string(),
             lang: "en".to_string(),
             time_slice_interval: 3.0,
+            timeout: Some(60),
             test: Some(TestConfig {
                 concurrent: Some(4),
                 context: Some("4096".to_string()),
@@ -255,6 +260,7 @@ mod tests {
 
         let yaml = serde_yaml::to_string(&config).unwrap();
         assert!(yaml.contains("base_url: https://api.example.com/v1"));
+        assert!(yaml.contains("timeout: 60"));
         assert!(yaml.contains("concurrent: 4"));
         assert!(yaml.contains("prompt: hello"));
     }

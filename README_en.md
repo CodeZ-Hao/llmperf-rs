@@ -56,6 +56,7 @@ On first run, if config file doesn't exist:
 | `model` | String | No | `gpt-4` | Default model (also supports `default_model`) |
 | `lang` | String | No | `en` | Output language `zh` / `en` |
 | `time_slice_interval` | Float | No | `3.0` | Time slice sampling interval (seconds) |
+| `timeout` | Integer | No | none | Request timeout (seconds); unlimited if unset |
 
 #### test sub-config
 
@@ -103,6 +104,7 @@ chat:
 --api-key <KEY>          API key (overrides config file, env: OPENAI_API_KEY)
 --json                   Output results in JSON format (suppresses progress display)
 --lang <LANG>            Output language (zh/en), overrides auto-detection
+--timeout <SECONDS>      Request timeout in seconds (default: no limit)
 --save-config <FILE>     Save current config to file and exit
 ```
 
@@ -124,6 +126,7 @@ llmperf-rs test [OPTIONS]
 | `--model <MODEL>` | `-m` | Config default | Test model |
 | `--env-monitor` | `-e` | `false` | Output environment info |
 | `--time-slice <SECS>` | - | `3.0` | Time slice sampling interval (seconds) |
+| `--timeout <SECONDS>` | - | no limit | Request timeout (seconds) |
 | `--json` | - | `false` | Output results in JSON format |
 | `--lang <LANG>` | - | Auto-detect | Output language (zh/en) |
 | `--save-config <FILE>` | - | - | Save current config to file and exit |
@@ -166,6 +169,7 @@ llmperf-rs chat [OPTIONS]
 | `--model <MODEL>` | `-m` | Config default | Chat model |
 | `--prompt <TEXT>` | `-p` | - | Initial prompt, supports `@filepath` to read from file |
 | `--max-tokens <NUM>` | - | `1024` | Max tokens per response |
+| `--timeout <SECONDS>` | - | no limit | Request timeout (seconds) |
 | `--lang <LANG>` | - | Auto-detect | Output language (zh/en) |
 | `--save-config <FILE>` | - | - | Save current config to file and exit |
 
