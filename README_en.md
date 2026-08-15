@@ -12,6 +12,7 @@ Supports concurrent testing with maximum output, JSON format output, quick testi
 - Support for OpenAI API-compatible LLM API testing
 - Real-time time-slice sampling with dynamic terminal table showing throughput per request
 - Concurrent request testing with system-level throughput statistics
+- Prompt built from "random nonce + noise filler + custom prompt": the nonce defeats prefix caching, the noise automatically targets the `-c` length (subtracting the custom prompt and fixed overhead), and final stats use the server-reported input/output tokens
 - Multiple context size testing (supports range format)
 - Interactive chat mode with support for loading prompts from files
 - Support for reasoning models (e.g., GLM-5's `reasoning_content` field)
@@ -52,8 +53,8 @@ On first run, if config file doesn't exist:
 | Parameter | Type | Required | Default | Description |
 |------------|------|----------|---------|-------------|
 | `base_url` | String | Yes | - | API base URL |
-| `api_key` | String | Yes | - | API key |
-| `model` | String | No | `gpt-4` | Default model (also supports `default_model`) |
+| `api_key` | String | No | empty string | API key (optional; empty string is used when omitted) |
+| `model` | String | No | first model from API | Default model (when unset, auto-fetches the first model from `GET /models`, falling back to `gpt-4` on failure; also supports `default_model` key) |
 | `lang` | String | No | `en` | Output language `zh` / `en` |
 | `time_slice_interval` | Float | No | `3.0` | Time slice sampling interval (seconds) |
 | `timeout` | Integer | No | none | Request timeout (seconds); unlimited if unset |
@@ -62,8 +63,9 @@ On first run, if config file doesn't exist:
 
 | Parameter | Type | Description |
 |------------|------|-------------|
-| `concurrent` | Integer | Number of concurrent requests |
+| `concurrent` | Integer | Total number of concurrent requests (shared across all context sizes) |
 | `context` | String | Context size |
+| `prompt` | String | Custom prompt (defaults to the repeat prompt) |
 | `max_tokens` | Integer | Max tokens to generate |
 | `env_monitor` | Boolean | Whether to output environment info |
 | `time_slice` | Float | Time slice sampling interval |
@@ -120,8 +122,9 @@ llmperf-rs test [OPTIONS]
 
 | Option | Short | Default | Description |
 |--------|-------|---------|-------------|
-| `--concurrent <NUM>` | `-j` | `1` | Number of concurrent requests |
+| `--concurrent <NUM>` | `-j` | `1` | Total number of concurrent requests (shared across all context sizes; excess requests queue up) |
 | `--context <SIZES>` | `-c` | `1024` | Context size, supports `start:step:end` range format |
+| `--prompt <TEXT>` | `-p` | Default repeat prompt | Custom prompt appended after the noise prefix |
 | `--max-tokens <NUM>` | - | `256` | Max tokens to generate |
 | `--model <MODEL>` | `-m` | Config default | Test model |
 | `--env-monitor` | `-e` | `false` | Output environment info |
@@ -137,10 +140,13 @@ llmperf-rs test [OPTIONS]
 # Default test
 llmperf-rs test
 
-# 4 concurrent, test 1024, 2048, 3072, 4096 context sizes sequentially
+# Total concurrency 4 (requests for each context size queue up in order 1024 -> 2048 -> 3072 -> 4096)
 llmperf-rs test -j 4 -c 1024:1024:4096
 
-# Specify model and API URL
+# Custom prompt (total prompt length still follows -c; the noise filler automatically subtracts the prompt and fixed overhead)
+llmperf-rs test -j 2 -c 4096 -p "Summarize the text above"
+
+# Specify model and API URL (api-key is optional; empty string is used when omitted)
 llmperf-rs test -m qwen-plus --base-url https://api.example.com/v1 --api-key sk-xxx
 
 # Use environment variables
@@ -167,8 +173,9 @@ llmperf-rs chat [OPTIONS]
 | Option | Short | Default | Description |
 |--------|-------|---------|-------------|
 | `--model <MODEL>` | `-m` | Config default | Chat model |
-| `--prompt <TEXT>` | `-p` | - | Initial prompt, supports `@filepath` to read from file |
+| `--prompt <TEXT>` | `-p` | - | When given, runs one-shot mode: streams the response then prints throughput stats, no interactive loop. Supports `@filepath` to read from file |
 | `--max-tokens <NUM>` | - | `1024` | Max tokens per response |
+| `--json` | - | `false` | One-shot mode: output the result as JSON (no streaming; requires `-p` or config `chat.prompt`) |
 | `--timeout <SECONDS>` | - | no limit | Request timeout (seconds) |
 | `--lang <LANG>` | - | Auto-detect | Output language (zh/en) |
 | `--save-config <FILE>` | - | - | Save current config to file and exit |
@@ -176,14 +183,17 @@ llmperf-rs chat [OPTIONS]
 **Examples:**
 
 ```bash
-# Default chat
+# Default chat (interactive mode)
 llmperf-rs chat
 
 # Specify model
 llmperf-rs chat -m gpt-4
 
-# With initial prompt
+# One-shot mode: single request, streamed output + throughput stats at the end
 llmperf-rs chat -p "Explain quantum computing"
+
+# One-shot mode with JSON output (suitable for scripting)
+llmperf-rs chat -p "Explain quantum computing" --json
 
 # Read prompt from file
 llmperf-rs chat -p @prompt.txt
@@ -191,7 +201,7 @@ llmperf-rs chat -p @prompt.txt
 # Save config
 llmperf-rs chat -p "hello" --save-config chat.yaml
 
-# Restore chat scenario from config file (auto-executes saved prompt)
+# Restore chat scenario from config file (one-shot if chat.prompt is set, interactive otherwise)
 llmperf-rs --config chat.yaml
 ```
 

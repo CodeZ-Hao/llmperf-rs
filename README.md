@@ -12,6 +12,7 @@ LLM API Testing CLI Tool - 用于测试 LLM API 性能的命令行工具。
 - 支持 OpenAI API 兼容的 LLM API 测试
 - 实时时间片采样，终端表格动态显示每个请求的吞吐量
 - 并发请求测试，系统级吞吐量统计
+- 提示词由「随机前缀 + 噪声填充 + 自定义提示词」组成：随机前缀破除前缀缓存，噪声按 `-c` 目标长度自动扣减提示词与固定开销，最终统计以服务端回传的真实输入/输出 tokens 为准
 - 多种上下文大小测试（支持范围格式）
 - 交互式聊天模式，支持从文件加载 prompt
 - 支持 reasoning 模型（如 GLM-5 的 `reasoning_content` 字段）
@@ -52,8 +53,8 @@ cargo build --release
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|------|--------|------|
 | `base_url` | String | 是 | - | API 基础地址 |
-| `api_key` | String | 是 | - | API 密钥 |
-| `model` | String | 否 | `gpt-4` | 默认模型 (也支持 `default_model`) |
+| `api_key` | String | 否 | 空字符串 | API 密钥（可省略，省略时使用空字符串） |
+| `model` | String | 否 | API 第一个模型 | 默认模型（未配置时自动从 `GET /models` 取第一个模型，失败回退 `gpt-4`；也支持 `default_model` 键） |
 | `lang` | String | 否 | `en` | 输出语言 `zh` / `en` |
 | `time_slice_interval` | Float | 否 | `3.0` | 时间片采样间隔（秒） |
 | `timeout` | Integer | 否 | 无 | 请求超时时间（秒），不设置则不限制 |
@@ -62,8 +63,9 @@ cargo build --release
 
 | 参数 | 类型 | 说明 |
 |------|------|------|
-| `concurrent` | Integer | 并发请求数 |
+| `concurrent` | Integer | 总并发请求数（所有上下文大小共享） |
 | `context` | String | 上下文大小 |
+| `prompt` | String | 自定义提示词（默认使用复述提示词） |
 | `max_tokens` | Integer | 最大生成 token 数 |
 | `env_monitor` | Boolean | 是否输出环境信息 |
 | `time_slice` | Float | 时间片采样间隔 |
@@ -120,8 +122,9 @@ llmperf-rs test [OPTIONS]
 
 | 选项 | 简写 | 默认值 | 说明 |
 |------|------|--------|------|
-| `--concurrent <NUM>` | `-j` | `1` | 并发请求数 |
+| `--concurrent <NUM>` | `-j` | `1` | 总并发请求数（所有上下文大小共享，超出的请求排队等待） |
 | `--context <SIZES>` | `-c` | `1024` | 上下文大小，支持 `start:step:end` 范围格式 |
+| `--prompt <TEXT>` | `-p` | 默认复述提示词 | 自定义提示词（附加在噪声前缀之后） |
 | `--max-tokens <NUM>` | - | `256` | 最大生成 token 数 |
 | `--model <MODEL>` | `-m` | 配置文件默认值 | 测试模型 |
 | `--env-monitor` | `-e` | `false` | 输出环境信息 |
@@ -137,10 +140,13 @@ llmperf-rs test [OPTIONS]
 # 默认测试
 llmperf-rs test
 
-# 4 并发，依次测试1024、2048、3072、4096 4段上下文长度下数据
+# 总并发 4（各上下文大小的请求按 1024→2048→3072→4096 依次排队执行）
 llmperf-rs test -j 4 -c 1024:1024:4096
 
-# 指定模型和 API 地址
+# 自定义提示词（提示词总长度仍按 -c 控制，噪声前缀自动扣除提示词与固定开销的 token 数）
+llmperf-rs test -j 2 -c 4096 -p "请总结上述文本"
+
+# 指定模型和 API 地址（api-key 可省略，省略时使用空字符串）
 llmperf-rs test -m qwen-plus --base-url https://api.example.com/v1 --api-key sk-xxx
 
 # 使用环境变量
@@ -167,8 +173,9 @@ llmperf-rs chat [OPTIONS]
 | 选项 | 简写 | 默认值 | 说明 |
 |------|------|--------|------|
 | `--model <MODEL>` | `-m` | 配置文件默认值 | 聊天模型 |
-| `--prompt <TEXT>` | `-p` | - | 初始 prompt，支持 `@filepath` 从文件读取 |
+| `--prompt <TEXT>` | `-p` | - | 提供时进入一击模式：流式打印生成结果后输出吞吐统计，不进入交互循环。支持 `@filepath` 从文件读取 |
 | `--max-tokens <NUM>` | - | `1024` | 每次回复最大 token 数 |
+| `--json` | - | `false` | 一击模式下以 JSON 输出结果（不流式打印；prompt 缺失时需 `-p` 或配置文件 `chat.prompt`） |
 | `--timeout <SECONDS>` | - | 不限制 | 请求超时时间（秒） |
 | `--lang <LANG>` | - | 自动检测 | 输出语言 (zh/en) |
 | `--save-config <FILE>` | - | - | 保存当前配置到文件并退出 |
@@ -176,14 +183,17 @@ llmperf-rs chat [OPTIONS]
 **示例：**
 
 ```bash
-# 默认聊天
+# 默认聊天（交互模式）
 llmperf-rs chat
 
 # 指定模型
 llmperf-rs chat -m gpt-4
 
-# 带初始 prompt
+# 一击模式：一次性请求，流式打印结果 + 末尾吞吐统计
 llmperf-rs chat -p "请解释量子计算"
+
+# 一击模式 + JSON 输出（适合脚本调用）
+llmperf-rs chat -p "请解释量子计算" --json
 
 # 从文件读取 prompt
 llmperf-rs chat -p @prompt.txt
@@ -191,11 +201,11 @@ llmperf-rs chat -p @prompt.txt
 # 保存配置
 llmperf-rs chat -p "hello" --save-config chat.yaml
 
-# 从配置文件恢复聊天场景（自动执行保存的 prompt）
+# 从配置文件恢复聊天场景（有 chat.prompt 时为一击模式，否则进入交互模式）
 llmperf-rs --config chat.yaml
 ```
 
-聊天模式内置命令：`/clear` 清空历史、`/exit` 退出、`/help` 帮助。
+交互模式内置命令：`/clear` 清空历史、`/exit` 退出、`/help` 帮助。
 
 ## 输出说明
 

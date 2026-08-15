@@ -1,17 +1,46 @@
 use crate::client::{ApiClient, ChatMessage, ChatStreamResult};
-use crate::config::Config;
+use crate::config::{Config, DEFAULT_MODEL};
+use serde_json::json;
 use std::io::{self, Write};
 use std::time::Duration;
 
-pub fn run_chat(config: Config, model: Option<String>, initial_prompt: Option<String>, max_tokens: u32) {
-    let model = model.unwrap_or(config.model);
+pub fn run_chat(config: Config, model: Option<String>, initial_prompt: Option<String>, max_tokens: u32, json_output: bool) {
+    let model = model.or(config.model);
     let client = ApiClient::new(
         config.base_url.unwrap(),
-        config.api_key.unwrap(),
+        config.api_key.unwrap_or_default(),
         config.timeout.map(Duration::from_secs),
     );
     let lang = config.lang;
 
+    let runtime = tokio::runtime::Runtime::new().expect("Failed to create runtime");
+
+    // Resolve model: explicit > first model from the API > gpt-4 fallback
+    let model = match model {
+        Some(m) => m,
+        None => match runtime.block_on(client.fetch_first_model()) {
+            Some(m) => m,
+            None => {
+                eprintln!("Warning: no model configured and failed to fetch models from API, falling back to \"{}\"", DEFAULT_MODEL);
+                DEFAULT_MODEL.to_string()
+            }
+        },
+    };
+
+    // One-shot mode: -p given or --json (non-interactive, suitable for scripting)
+    if initial_prompt.is_some() || json_output {
+        let prompt_text = match initial_prompt {
+            Some(p) => p,
+            None => {
+                eprintln!("Error: --json requires a prompt (use -p or set chat.prompt in config)");
+                std::process::exit(1);
+            }
+        };
+        run_one_shot(&client, &model, &prompt_text, max_tokens, &lang, json_output, &runtime);
+        return;
+    }
+
+    // Interactive mode
     let (help_cmd, help_clear, help_exit, help_error, lbl_user, lbl_ai,
          lbl_prefill, lbl_decode, lbl_stats) = if lang == "zh" {
         ("帮助", "清空对话历史", "退出聊天", "错误",
@@ -29,21 +58,14 @@ pub fn run_chat(config: Config, model: Option<String>, initial_prompt: Option<St
     println!("  /help  - {}", help_cmd);
     println!("-----------\n");
 
-    let runtime = tokio::runtime::Runtime::new().expect("Failed to create runtime");
     let mut messages: Vec<(String, String)> = Vec::new();
-    let mut first_input = initial_prompt;
 
     loop {
-        let input = if let Some(prompt) = first_input.take() {
-            println!("{} {}", lbl_user, prompt);
-            prompt
-        } else {
-            print!("\n{} ", lbl_user);
-            io::stdout().flush().unwrap();
-            let mut buf = String::new();
-            io::stdin().read_line(&mut buf).unwrap();
-            buf.trim().to_string()
-        };
+        print!("\n{} ", lbl_user);
+        io::stdout().flush().unwrap();
+        let mut buf = String::new();
+        io::stdin().read_line(&mut buf).unwrap();
+        let input = buf.trim().to_string();
 
         if input.is_empty() {
             continue;
@@ -119,6 +141,81 @@ pub fn run_chat(config: Config, model: Option<String>, initial_prompt: Option<St
     }
 }
 
+/// One-shot chat: stream the response (unless JSON), then print throughput stats
+/// (or the JSON result). No interactive loop.
+fn run_one_shot(
+    client: &ApiClient,
+    model: &str,
+    prompt_text: &str,
+    max_tokens: u32,
+    lang: &str,
+    json_output: bool,
+    runtime: &tokio::runtime::Runtime,
+) {
+    let (lbl_user, lbl_ai, lbl_stats, lbl_prefill, lbl_decode) = if lang == "zh" {
+        ("用户", "AI", "统计信息", "Prefill", "Decode")
+    } else {
+        ("You", "AI", "Statistics", "Prefill", "Decode")
+    };
+
+    if !json_output {
+        println!("\n{} {}", lbl_user, prompt_text);
+        print!("{} ", lbl_ai);
+        io::stdout().flush().unwrap();
+    }
+
+    let chat_messages = vec![ChatMessage {
+        role: "user".to_string(),
+        content: prompt_text.to_string(),
+    }];
+
+    let result = runtime.block_on(
+        client.chat_streaming(model, chat_messages, max_tokens, |chunk| {
+            if !json_output {
+                print!("{}", chunk);
+                io::stdout().flush().unwrap();
+            }
+        })
+    );
+
+    match result {
+        Ok(chat_result) => {
+            if json_output {
+                let output = json!({
+                    "model": model,
+                    "prompt": prompt_text,
+                    "content": chat_result.content,
+                    "prompt_tokens": chat_result.prompt_tokens,
+                    "completion_tokens": chat_result.completion_tokens,
+                    "prefill_tok_per_sec": round2(chat_result.prefill_tps.unwrap_or(0.0)),
+                    "decode_tok_per_sec": round2(chat_result.decode_tps.unwrap_or(0.0)),
+                    "total_duration_secs": round2(chat_result.total_duration_secs),
+                });
+                println!("{}", serde_json::to_string_pretty(&output).unwrap_or_else(|_| "{}".to_string()));
+            } else {
+                if chat_result.content.is_empty() {
+                    println!("(empty response)");
+                }
+                print_stats(&chat_result, lang, lbl_stats, lbl_prefill, lbl_decode);
+            }
+        }
+        Err(e) => {
+            if json_output {
+                let output = json!({
+                    "error": e,
+                    "model": model,
+                    "prompt": prompt_text,
+                });
+                println!("{}", serde_json::to_string_pretty(&output).unwrap_or_else(|_| "{}".to_string()));
+                std::process::exit(1);
+            } else {
+                let help_error = if lang == "zh" { "错误" } else { "Error" };
+                println!("{}: {}", help_error, e);
+            }
+        }
+    }
+}
+
 fn print_stats(
     result: &ChatStreamResult, lang: &str,
     lbl_stats: &str, lbl_prefill: &str, lbl_decode: &str,
@@ -140,4 +237,8 @@ fn print_stats(
                 lbl_decode, completion_tokens, lbl_decode, decode_tps, tok_unit);
         }
     }
+}
+
+fn round2(v: f64) -> f64 {
+    (v * 100.0).round() / 100.0
 }

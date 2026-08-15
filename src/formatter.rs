@@ -1,6 +1,7 @@
 use crate::live_display::LiveTestResult;
 use crate::utils::pad_center;
 use serde_json::json;
+use std::time::{Duration, Instant};
 
 
 /// Print final aggregate results showing system-wide throughput
@@ -101,11 +102,18 @@ pub fn build_json_results(
     };
 
     let requests_json: Vec<serde_json::Value> = results.iter().map(|r| {
+        let prefill_tps = if r.prefilled && r.prefill_duration_secs > 0.001 {
+            r.prompt_tokens as f64 / r.prefill_duration_secs
+        } else {
+            0.0
+        };
         json!({
             "request_id": r.request_id + 1,
             "success": r.success,
+            "context_size": r.context_size,
             "prompt_tokens": r.prompt_tokens,
             "completion_tokens": r.completion_tokens,
+            "prefill_tok_per_sec": round2(prefill_tps),
             "prefill_duration_secs": round2(r.prefill_duration_secs),
             "decode_duration_secs": round2(r.decode_duration_secs),
             "total_duration_secs": round2(r.total_duration_secs),
@@ -138,35 +146,79 @@ pub fn build_json_results(
     serde_json::to_string_pretty(&output).unwrap_or_else(|_| "{}".to_string())
 }
 
+/// System throughput = total tokens / the union of the busy intervals.
+/// This accumulates tokens over the actual busy timeline: for sequential
+/// (single-concurrency) runs the union is the sum of per-request durations,
+/// so throughput is the time-averaged rate — never the sum of per-request
+/// rates. For parallel runs the union is the wall-clock span, which yields
+/// the true system-level rate.
 fn calc_throughput_stats(results: &[&LiveTestResult]) -> (f64, f64, f64, f64, f64) {
     let total_prompt_tokens: f64 = results.iter().map(|r| r.prompt_tokens as f64).sum();
     let total_completion_tokens: f64 = results.iter().map(|r| r.completion_tokens as f64).sum();
 
-    let total_time: f64 = results.iter()
-        .map(|r| r.total_duration_secs)
-        .fold(0.0_f64, |a, b| a.max(b));
+    let prefill_intervals: Vec<(Instant, Instant)> = results.iter()
+        .filter(|r| r.prefilled && r.prefill_duration_secs > 0.001)
+        .map(|r| (
+            r.start,
+            r.start + Duration::from_secs_f64(r.prefill_duration_secs),
+        ))
+        .collect();
 
-    let max_prefill_time: f64 = results.iter()
-        .map(|r| r.prefill_duration_secs)
-        .fold(0.0_f64, |a, b| a.max(b));
+    let decode_intervals: Vec<(Instant, Instant)> = results.iter()
+        .filter(|r| r.prefilled && r.decode_duration_secs > 0.001)
+        .map(|r| (
+            r.start + Duration::from_secs_f64(r.prefill_duration_secs),
+            r.start + Duration::from_secs_f64(r.total_duration_secs),
+        ))
+        .collect();
 
-    let sys_prefill_tps = if max_prefill_time > 0.001 {
-        total_prompt_tokens / max_prefill_time
+    let full_intervals: Vec<(Instant, Instant)> = results.iter()
+        .map(|r| (
+            r.start,
+            r.start + Duration::from_secs_f64(r.total_duration_secs),
+        ))
+        .collect();
+
+    let prefill_span = union_duration(prefill_intervals);
+    let decode_span = union_duration(decode_intervals);
+    let total_time = union_duration(full_intervals);
+
+    let sys_prefill_tps = if prefill_span > 0.001 {
+        total_prompt_tokens / prefill_span
     } else {
         0.0
     };
 
-    let max_decode_time: f64 = results.iter()
-        .map(|r| r.decode_duration_secs)
-        .fold(0.0_f64, |a, b| a.max(b));
-
-    let sys_decode_tps = if max_decode_time > 0.001 {
-        total_completion_tokens / max_decode_time
+    let sys_decode_tps = if decode_span > 0.001 {
+        total_completion_tokens / decode_span
     } else {
         0.0
     };
 
     (total_prompt_tokens, total_completion_tokens, total_time, sys_prefill_tps, sys_decode_tps)
+}
+
+/// Length of the union of intervals (wall-clock time during which at least one
+/// interval was active). Sequential intervals add up; overlapping ones merge.
+fn union_duration(mut intervals: Vec<(Instant, Instant)>) -> f64 {
+    if intervals.is_empty() {
+        return 0.0;
+    }
+    intervals.sort_unstable_by_key(|(s, _)| *s);
+    let mut total = Duration::ZERO;
+    let mut cur_start = intervals[0].0;
+    let mut cur_end = intervals[0].1;
+    for &(s, e) in intervals.iter().skip(1) {
+        if s > cur_end {
+            total += cur_end - cur_start;
+            cur_start = s;
+            cur_end = e;
+        } else if e > cur_end {
+            cur_end = e;
+        }
+    }
+    total += cur_end - cur_start;
+    total.as_secs_f64()
 }
 
 fn round2(v: f64) -> f64 {

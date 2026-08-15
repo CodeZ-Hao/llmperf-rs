@@ -14,6 +14,8 @@ pub enum TokenEvent {
         request_id: usize,
         start_time: Instant,
         prompt_tokens: u32,
+        /// Target context size (for display; may differ from actual server input tokens)
+        context_size: u32,
     },
     /// First token received - marks end of prefill
     FirstToken {
@@ -213,6 +215,7 @@ pub struct ChatStreamResult {
     pub completion_tokens: Option<u32>,
     pub prefill_tps: Option<f64>,  // tokens per second for input
     pub decode_tps: Option<f64>,  // tokens per second for output
+    pub total_duration_secs: f64,
 }
 
 impl ApiClient {
@@ -239,6 +242,7 @@ impl ApiClient {
         prompt: &str,
         max_tokens: u32,
         prompt_tokens: u32,
+        context_size: u32,
         tx: mpsc::UnboundedSender<TokenEvent>,
         stop_notify: Arc<Notify>,
     ) {
@@ -248,6 +252,7 @@ impl ApiClient {
             request_id,
             start_time: start,
             prompt_tokens,
+            context_size,
         }).is_err() {
             eprintln!("[req {}] event channel closed before RequestStarted", request_id);
             return;
@@ -308,6 +313,7 @@ impl ApiClient {
         let mut first_token_sent = false;
         let mut output_token_count: u32 = 0;
         let mut server_completion_tokens: Option<u32> = None;
+        let mut server_prompt_tokens: Option<u32> = None;
 
         loop {
             let chunk = tokio::select! {
@@ -318,7 +324,7 @@ impl ApiClient {
                         request_id,
                         time: Instant::now(),
                         completion_tokens: final_tokens,
-                        prompt_tokens,
+                        prompt_tokens: server_prompt_tokens.unwrap_or(prompt_tokens),
                         success: false,
                         error: Some("interrupted".to_string()),
                     });
@@ -332,6 +338,7 @@ impl ApiClient {
                     process_sse_buffer(&mut buffer, &bytes, |delta| {
                         if let Some(usage) = delta.usage {
                             server_completion_tokens = usage.completion_tokens;
+                            server_prompt_tokens = usage.prompt_tokens;
                         }
                         if let Some(content) = delta.content {
                             if !content.is_empty() {
@@ -362,8 +369,8 @@ impl ApiClient {
                     let _ = tx.send(TokenEvent::Completed {
                         request_id,
                         time: Instant::now(),
-                        completion_tokens: output_token_count,
-                        prompt_tokens,
+                        completion_tokens: server_completion_tokens.unwrap_or(output_token_count),
+                        prompt_tokens: server_prompt_tokens.unwrap_or(prompt_tokens),
                         success: false,
                         error: Some(format!("Stream error: {}", e)),
                     });
@@ -376,15 +383,46 @@ impl ApiClient {
             }
         }
 
+        // Prefer server-reported usage (real tokenizer counts); local estimates
+        // (tiktoken / char heuristics) only serve as fallback when the server
+        // does not return usage in the stream.
         let final_tokens = server_completion_tokens.unwrap_or(output_token_count);
+        let final_prompt_tokens = server_prompt_tokens.unwrap_or(prompt_tokens);
         let _ = tx.send(TokenEvent::Completed {
             request_id,
             time: Instant::now(),
             completion_tokens: final_tokens,
-            prompt_tokens,
+            prompt_tokens: final_prompt_tokens,
             success: true,
             error: None,
         });
+    }
+
+    /// Fetch the first model from GET /models, used as the default model when
+    /// none is configured. Returns None if the endpoint is unavailable.
+    pub async fn fetch_first_model(&self) -> Option<String> {
+        let url = format!("{}/models", self.base_url);
+        let resp = self
+            .client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let text = resp.text().await.ok()?;
+        #[derive(Deserialize)]
+        struct ModelsResponse {
+            data: Vec<ModelEntry>,
+        }
+        #[derive(Deserialize)]
+        struct ModelEntry {
+            id: String,
+        }
+        let models: ModelsResponse = serde_json::from_str(&text).ok()?;
+        models.data.into_iter().next().map(|m| m.id)
     }
 
     /// Streaming chat for interactive mode
@@ -504,6 +542,7 @@ impl ApiClient {
             completion_tokens: Some(output_tokens),
             prefill_tps,
             decode_tps,
+            total_duration_secs: start.elapsed().as_secs_f64(),
         })
     }
 }

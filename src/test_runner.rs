@@ -4,7 +4,7 @@ use crate::live_display::{LiveDisplay, LiveTestResult};
 use rand::Rng;
 use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{mpsc, Mutex, Notify};
 
 /// Run tests with live display and event-based streaming
 pub async fn run_live_test(
@@ -13,6 +13,7 @@ pub async fn run_live_test(
     context_sizes: Vec<u32>,
     max_tokens: u32,
     model: String,
+    custom_prompt: Option<String>,
     stop_flag: Arc<AtomicBool>,
     stop_notify: Arc<Notify>,
     time_slice_secs: f64,
@@ -24,31 +25,49 @@ pub async fn run_live_test(
 
     let mut display = LiveDisplay::new(total_requests, time_slice_secs, lang, silent);
 
-    // Spawn all request tasks
+    // Worker pool: `concurrent` workers pull request specs from a FIFO queue.
+    // This makes -j the global concurrency cap AND guarantees strict execution
+    // order (requests run in submission order: context-major).
+    let (req_tx, req_rx) = mpsc::unbounded_channel::<(usize, u32, Option<String>)>();
+    let req_rx = Arc::new(Mutex::new(req_rx));
+
+    for _ in 0..concurrent {
+        let client = client.clone();
+        let model = model.clone();
+        let max_tokens = max_tokens;
+        let tx = tx.clone();
+        let sn = stop_notify.clone();
+        let req_rx = req_rx.clone();
+        let stop_flag = stop_flag.clone();
+
+        tokio::spawn(async move {
+            loop {
+                if stop_flag.load(Ordering::Relaxed) {
+                    break;
+                }
+                let spec = req_rx.lock().await.recv().await;
+                let (rid, ctx, task_prompt) = match spec {
+                    Some(s) => s,
+                    None => break, // queue closed, no more requests
+                };
+                let prompt = build_test_prompt(ctx, task_prompt.as_deref());
+                client.test_streaming_with_events(rid, &model, &prompt, max_tokens, ctx, ctx, tx.clone(), sn.clone()).await;
+            }
+        });
+    }
+
+    // Enqueue all requests in order (context-major: all requests of one context
+    // size first, so with -j 1 the test runs 1024 -> 2048 -> ... sequentially)
     let mut request_id = 0usize;
     for context_size in &context_sizes {
         for _ in 0..concurrent {
-            if stop_flag.load(Ordering::Relaxed) {
-                break;
-            }
-            let client = client.clone();
-            let model = model.clone();
-            let max_tokens = max_tokens;
-            let ctx = *context_size;
-            let tx = tx.clone();
-            let rid = request_id;
-            let sn = stop_notify.clone();
-
-            tokio::spawn(async move {
-                let prompt = generate_random_prompt(ctx);
-                client.test_streaming_with_events(rid, &model, &prompt, max_tokens, ctx, tx, sn).await;
-            });
-
+            let _ = req_tx.send((request_id, *context_size, custom_prompt.clone()));
             request_id += 1;
         }
     }
+    drop(req_tx);
 
-    // Drop the original sender so rx closes when all tasks finish
+    // Drop the original sender so rx closes when all workers finish
     drop(tx);
 
     // Event loop: process events and tick display
@@ -197,6 +216,40 @@ fn generate_random_prompt(target_tokens: u32) -> String {
     result
 }
 
+/// Default task prompt: asks the model to repeat the text above, keeping
+/// output length comparable across runs. Used when no custom prompt is given.
+const DEFAULT_REPEAT_PROMPT: &str = "Please repeat the text above exactly, without adding anything else.";
+
+/// Random nonce so every request starts with unique tokens, defeating
+/// server-side prefix caching (KV cache reuse across requests).
+fn generate_random_nonce() -> String {
+    let nonce: u64 = rand::thread_rng().gen();
+    format!("[nonce:{:016x}]", nonce)
+}
+
+/// Build the full test prompt: random nonce + noise text + task prompt.
+/// - nonce: breaks prefix caching
+/// - noise: fills up to ~`context_size` tokens; its budget accounts for the
+///   fixed overhead (nonce + separators) and the task prompt, so the total
+///   prompt length stays close to the requested context size
+/// - task prompt: the user-provided prompt (-p), or the default repeat prompt
+pub fn build_test_prompt(context_size: u32, custom_prompt: Option<&str>) -> String {
+    let task_prompt = custom_prompt
+        .map(|p| p.trim())
+        .filter(|p| !p.is_empty())
+        .unwrap_or(DEFAULT_REPEAT_PROMPT);
+
+    let nonce = generate_random_nonce();
+
+    // Fixed overhead: nonce + newlines + task prompt (local estimate)
+    let fixed_overhead = count_tokens(&format!("{}\n\n", nonce))
+        + count_tokens(&format!("\n\n{}", task_prompt));
+    let noise_tokens = context_size.saturating_sub(fixed_overhead as u32).max(1);
+
+    let noise = generate_random_prompt(noise_tokens);
+    format!("{}\n\n{}\n\n{}", nonce, noise, task_prompt)
+}
+
 pub fn parse_step_format(input: &str) -> Vec<u32> {
     if input.contains(':') {
         let parts: Vec<&str> = input.split(':').collect();
@@ -256,6 +309,36 @@ mod tests {
         // Should be within a small margin of the target
         assert!(actual >= 95 && actual <= 110,
             "Expected ~100 tokens, got {}", actual);
+    }
+
+    #[test]
+    fn test_build_test_prompt_token_count() {
+        for size in [1024, 4096, 16384] {
+            let prompt = build_test_prompt(size, None);
+            let actual = count_tokens(&prompt) as u32;
+            let drift = (actual as i64 - size as i64).abs();
+            let tolerance = ((size as f64 * 0.03) as i64).max(10);
+            assert!(drift <= tolerance,
+                "expected ~{} tokens, got {} (drift {}, tolerance {})", size, actual, drift, tolerance);
+        }
+    }
+
+    #[test]
+    fn test_build_test_prompt_custom() {
+        let prompt = build_test_prompt(512, Some("Answer with a single word."));
+        assert!(prompt.starts_with("[nonce:"));
+        assert!(prompt.ends_with("Answer with a single word."));
+        // Nonce must differ between requests (breaks prefix caching)
+        let prompt2 = build_test_prompt(512, Some("Answer with a single word."));
+        assert_ne!(prompt, prompt2, "nonce should differ between requests");
+    }
+
+    #[test]
+    fn test_build_test_prompt_tiny_context() {
+        // Context smaller than fixed overhead: still produces a valid prompt
+        let prompt = build_test_prompt(1, None);
+        assert!(prompt.starts_with("[nonce:"));
+        assert!(prompt.ends_with(DEFAULT_REPEAT_PROMPT));
     }
 
     #[test]

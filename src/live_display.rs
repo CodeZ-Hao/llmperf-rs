@@ -11,6 +11,8 @@ pub struct RequestState {
     pub first_token_time: Option<Instant>,
     pub end_time: Option<Instant>,
     pub prompt_tokens: u32,
+    /// Target context size of this request (from -c, for display)
+    pub context_size: u32,
     pub completed: bool,
     pub success: bool,
     pub error: Option<String>,
@@ -35,6 +37,12 @@ pub struct TimeBucket {
 #[derive(Debug, Clone)]
 pub struct LiveTestResult {
     pub request_id: usize,
+    /// Absolute request start time, for wall-clock interval arithmetic
+    pub start: Instant,
+    /// Whether the first token arrived (prefill completed)
+    pub prefilled: bool,
+    /// Target context size of this request
+    pub context_size: u32,
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub prefill_duration_secs: f64,
@@ -46,6 +54,28 @@ pub struct LiveTestResult {
 
 const SPINNER_CHARS: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+/// Total duration (seconds) of the union of time intervals: sort by start,
+/// merge overlapping spans, sum. Used for system prefill throughput —
+/// concurrent prefills share the same wall-clock span and must not stack.
+fn union_duration(intervals: &[(Instant, Instant)]) -> f64 {
+    if intervals.is_empty() {
+        return 0.0;
+    }
+    let mut sorted: Vec<(Instant, Instant)> = intervals.to_vec();
+    sorted.sort_unstable_by_key(|(s, _)| *s);
+    let mut total = 0.0;
+    let mut cur = sorted[0];
+    for &(s, e) in &sorted[1..] {
+        if s > cur.1 {
+            total += cur.1.duration_since(cur.0).as_secs_f64();
+            cur = (s, e);
+        } else if e > cur.1 {
+            cur.1 = e;
+        }
+    }
+    total + cur.1.duration_since(cur.0).as_secs_f64()
+}
+
 
 impl RequestState {
     pub fn new(request_id: usize) -> Self {
@@ -55,6 +85,7 @@ impl RequestState {
             first_token_time: None,
             end_time: None,
             prompt_tokens: 0,
+            context_size: 0,
             completed: false,
             success: false,
             error: None,
@@ -109,10 +140,11 @@ impl LiveDisplay {
     /// Process a single token event and update internal state
     pub fn process_event(&mut self, event: TokenEvent) {
         match event {
-            TokenEvent::RequestStarted { request_id, start_time, prompt_tokens } => {
+            TokenEvent::RequestStarted { request_id, start_time, prompt_tokens, context_size } => {
                 if let Some(req) = self.requests.get_mut(request_id) {
                     req.start_time = Some(start_time);
                     req.prompt_tokens = prompt_tokens;
+                    req.context_size = context_size;
                 }
             }
             TokenEvent::FirstToken { request_id, time } => {
@@ -165,7 +197,9 @@ impl LiveDisplay {
         self.render(now);
     }
 
-    /// Collect a time-slice bucket from current state
+    /// Collect a time-slice bucket from current state. Prefill is only
+    /// measurable once the first token arrives, so only completed prefills
+    /// (first_token_time set) are counted, with their full token counts.
     fn collect_bucket(&mut self, now: Instant) {
         let slice_dur = now.duration_since(self.last_slice_time).as_secs_f64();
         if slice_dur < 0.001 {
@@ -178,13 +212,11 @@ impl LiveDisplay {
         let mut decode_active: usize = 0;
 
         for req in &self.requests {
-            if req.start_time.is_none() {
-                continue;
-            }
-            if req.is_prefill() {
+            if req.start_time.is_some() && req.first_token_time.is_some() {
                 prefill_active += 1;
                 prefill_input_tokens += req.prompt_tokens as f64;
-            } else if req.is_decode() || (req.completed && req.slice_tokens > 0) {
+            }
+            if req.is_decode() || (req.completed && req.slice_tokens > 0) {
                 decode_active += 1;
                 decode_output_tokens += req.slice_tokens;
             }
@@ -242,16 +274,18 @@ impl LiveDisplay {
 
         // Column widths
         let col_id = 6;
+        let col_ctx = 8;
         let col_status = 12;
-        let col_tps = 14;
+        let col_prefill = 14;
+        let col_decode = 14;
         let col_tokens = 10;
         let col_time = 10;
 
-        let (lbl_id, lbl_status, lbl_tps, lbl_tokens, lbl_time) =
+        let (lbl_id, lbl_ctx, lbl_status, lbl_prefill, lbl_decode, lbl_tokens, lbl_time) =
             if self.lang == "zh" {
-                ("#", "状态", "吞吐(t/s)", "输出Token", "耗时(s)")
+                ("#", "上下文", "状态", "Prefill(t/s)", "Decode(t/s)", "输出Token", "耗时(s)")
             } else {
-                ("#", "Status", "Tput(t/s)", "Out Toks", "Time(s)")
+                ("#", "Ctx", "Status", "Prefill(t/s)", "Decode(t/s)", "Out Toks", "Time(s)")
             };
 
         // Time header
@@ -264,10 +298,12 @@ impl LiveDisplay {
 
         // Table header
         let header = format!(
-            " {} | {} | {} | {} | {}",
+            " {} | {} | {} | {} | {} | {} | {}",
             pad_center(lbl_id, col_id),
+            pad_center(lbl_ctx, col_ctx),
             pad_center(lbl_status, col_status),
-            pad_center(lbl_tps, col_tps),
+            pad_center(lbl_prefill, col_prefill),
+            pad_center(lbl_decode, col_decode),
             pad_center(lbl_tokens, col_tokens),
             pad_center(lbl_time, col_time),
         );
@@ -277,7 +313,8 @@ impl LiveDisplay {
         // Request rows
         for req in &self.requests {
             let id_str = format!("{}", req.request_id + 1);
-            let (status_str, tps_str) = self.format_request_status(req, slice_elapsed, now);
+            let (status_str, prefill_str, decode_str) = self.format_request_metrics(req, slice_elapsed, now);
+            let ctx_str = format!("{}", req.context_size);
             let tokens_str = if req.completion_tokens > 0 {
                 format!("{}", req.completion_tokens)
             } else {
@@ -291,10 +328,12 @@ impl LiveDisplay {
             };
 
             let row = format!(
-                " {} | {} | {} | {} | {}",
+                " {} | {} | {} | {} | {} | {} | {}",
                 pad_center(&id_str, col_id),
+                pad_center(&ctx_str, col_ctx),
                 pad_center(&status_str, col_status),
-                pad_left(&tps_str, col_tps),
+                pad_left(&prefill_str, col_prefill),
+                pad_left(&decode_str, col_decode),
                 pad_left(&tokens_str, col_tokens),
                 pad_left(&time_str, col_time),
             );
@@ -305,7 +344,7 @@ impl LiveDisplay {
         lines.push("-".repeat(display_width(&header)));
 
         // System-wide aggregate for current slice
-        let (sys_prefill, sys_decode) = self.calc_system_throughput(slice_elapsed, now);
+        let (sys_prefill, sys_decode) = self.calc_system_throughput(slice_elapsed);
         let sys_line = if self.lang == "zh" {
             format!(
                 " 系统吞吐  Prefill: {:.0} input t/s | Decode: {:.1} output t/s",
@@ -322,11 +361,27 @@ impl LiveDisplay {
         lines
     }
 
-    /// Format a single request's status and throughput for display
-    fn format_request_status(&self, req: &RequestState, slice_elapsed: f64, now: Instant) -> (String, String) {
+    /// Format a single request's status and throughput for display.
+    /// Returns (status, prefill tps, decode tps).
+    fn format_request_metrics(&self, req: &RequestState, slice_elapsed: f64, now: Instant) -> (String, String, String) {
+        // Prefill tps is only measurable once the first token arrives (prefill
+        // phase complete, decode started): the duration is unknown before that,
+        // so no running estimate is shown. After first token the value is
+        // fixed; at completion it settles to the server-reported token count.
+        let prefill_str = if let (Some(start), Some(ft)) = (req.start_time, req.first_token_time) {
+            let prefill_dur = ft.duration_since(start).as_secs_f64();
+            if prefill_dur > 0.001 && req.prompt_tokens > 0 {
+                format!("{:.1}", req.prompt_tokens as f64 / prefill_dur)
+            } else {
+                "-".to_string()
+            }
+        } else {
+            "-".to_string()
+        };
+
         if req.start_time.is_none() {
             let lbl = if self.lang == "zh" { "等待" } else { "Wait" };
-            return (lbl.to_string(), "-".to_string());
+            return (lbl.to_string(), "-".to_string(), "-".to_string());
         }
 
         if req.completed {
@@ -336,10 +391,10 @@ impl LiveDisplay {
                     Some(v) => format!("{:.1}", v),
                     None => "-".to_string(),
                 };
-                return (lbl.to_string(), tps);
+                return (lbl.to_string(), prefill_str, tps);
             } else {
                 let lbl = if self.lang == "zh" { "失败" } else { "Fail" };
-                return (lbl.to_string(), "-".to_string());
+                return (lbl.to_string(), prefill_str, "-".to_string());
             }
         }
 
@@ -350,7 +405,7 @@ impl LiveDisplay {
             } else {
                 format!("{} Prefill", spinner)
             };
-            return (lbl, "-".to_string());
+            return (lbl, prefill_str, "-".to_string());
         }
 
         if req.is_decode() {
@@ -368,61 +423,48 @@ impl LiveDisplay {
             };
 
             let lbl = "Decode".to_string();
-            return (lbl, tps);
+            return (lbl, prefill_str, tps);
         }
 
-        ("-".to_string(), "-".to_string())
+        ("-".to_string(), "-".to_string(), "-".to_string())
     }
 
-    /// Calculate system-wide throughput for current slice
-    /// Prefill: total input tokens / wall-clock prefill time (from completed prefills)
-    /// Decode: total output tokens in slice / wall-clock slice time
-    fn calc_system_throughput(&self, slice_elapsed: f64, _now: Instant) -> (f64, f64) {
+    /// Calculate system-wide throughput for the current slice.
+    /// Prefill: only completed prefills are measurable — the duration is only
+    /// known once the first token arrives. Rate = total tokens of completed
+    /// prefills / the union of their prefill intervals (concurrent prefills
+    /// sharing wall-clock time don't stack). In-flight prefills contribute
+    /// nothing until they complete. Decode: tokens received in the slice /
+    /// slice duration.
+    fn calc_system_throughput(&self, slice_elapsed: f64) -> (f64, f64) {
         if slice_elapsed < 0.01 {
             return (0.0, 0.0);
         }
 
-        // Prefill: use completed prefill durations
-        let mut total_prefill_tokens: f64 = 0.0;
-        let mut max_prefill_time: f64 = 0.0;
-
-        // Decode: sum all tokens received in this slice / wall-clock slice time
-        let mut total_decode_tokens: u32 = 0;
-
+        let mut prefill_tokens: f64 = 0.0;
+        let mut prefill_intervals: Vec<(Instant, Instant)> = Vec::new();
         for req in &self.requests {
-            if req.start_time.is_none() {
-                continue;
+            if let (Some(start), Some(ft)) = (req.start_time, req.first_token_time) {
+                prefill_tokens += req.prompt_tokens as f64;
+                prefill_intervals.push((start, ft));
             }
+        }
+        let prefill_span = union_duration(&prefill_intervals);
+        let prefill_tps = if prefill_span > 0.001 {
+            prefill_tokens / prefill_span
+        } else {
+            0.0
+        };
 
-            // Prefill: track max prefill duration (concurrent requests overlap)
-            if let (Some(start), Some(first_tok)) = (req.start_time, req.first_token_time) {
-                let prefill_dur = first_tok.duration_since(start).as_secs_f64();
-                total_prefill_tokens += req.prompt_tokens as f64;
-                if prefill_dur > max_prefill_time {
-                    max_prefill_time = prefill_dur;
-                }
-            }
-
-            // Decode: sum all tokens from all decoding requests in this slice
+        // Decode: tokens actually received in this slice
+        let mut total_decode_tokens: u32 = 0;
+        for req in &self.requests {
             if req.is_decode() || (req.completed && req.slice_tokens > 0) {
                 total_decode_tokens += req.slice_tokens;
             }
         }
 
-        let prefill_tps = if max_prefill_time > 0.001 {
-            total_prefill_tokens / max_prefill_time
-        } else {
-            0.0
-        };
-
-        // System-wide decode = total tokens / wall-clock time
-        let decode_tps = if total_decode_tokens > 0 {
-            total_decode_tokens as f64 / slice_elapsed
-        } else {
-            0.0
-        };
-
-        (prefill_tps, decode_tps)
+        (prefill_tps, total_decode_tokens as f64 / slice_elapsed)
     }
 
     /// Final render - keep last state, don't clear
@@ -456,6 +498,9 @@ impl LiveDisplay {
 
             results.push(LiveTestResult {
                 request_id: req.request_id,
+                start,
+                prefilled: req.first_token_time.is_some(),
+                context_size: req.context_size,
                 prompt_tokens: req.prompt_tokens,
                 completion_tokens: req.completion_tokens,
                 prefill_duration_secs: prefill_dur,

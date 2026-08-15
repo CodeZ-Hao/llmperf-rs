@@ -9,7 +9,7 @@ mod utils;
 
 use clap::{Parser, Subcommand, ValueHint, CommandFactory, FromArgMatches};
 use client::ApiClient;
-use config::{Config, CliOverrides, TestConfig, ChatConfig};
+use config::{Config, CliOverrides, TestConfig, ChatConfig, DEFAULT_MODEL};
 use env_monitor::EnvMonitor;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -68,6 +68,10 @@ enum Commands {
         /// Context sizes (single value, or start:step:end range format)
         #[arg(short = 'c', long, default_value = "1024")]
         context: String,
+
+        /// Custom prompt appended after the noise prefix (default: repeat prompt)
+        #[arg(short = 'p', long)]
+        prompt: Option<String>,
 
         /// Max tokens to generate
         #[arg(long, default_value = "256")]
@@ -197,7 +201,7 @@ fn main() {
 
     // Apply model override from CLI
     if let Some(m) = &effective_model {
-        config.model = m.clone();
+        config.model = Some(m.clone());
     }
 
     // Apply timeout override from CLI
@@ -208,8 +212,8 @@ fn main() {
     // Merge config file defaults into subcommand params via value_source
     let sub_matches = matches.subcommand().map(|(_, m)| m);
 
-    let (concurrent, context, max_tokens_test, env_monitor, time_slice) =
-        if let Some(Commands::Test { concurrent, context, max_tokens, env_monitor, time_slice, .. }) = &cli.command {
+    let (concurrent, context, max_tokens_test, env_monitor, time_slice, test_prompt) =
+        if let Some(Commands::Test { concurrent, context, max_tokens, env_monitor, time_slice, prompt, .. }) = &cli.command {
             let tc = config.test.as_ref();
             let sm = sub_matches.unwrap();
             let c = if sm.value_source("concurrent") == Some(clap::parser::ValueSource::DefaultValue) {
@@ -227,7 +231,10 @@ fn main() {
             let ts = if time_slice.is_none() {
                 tc.and_then(|t| t.time_slice)
             } else { *time_slice };
-            (c, ctx, mt, em, ts)
+            let tp = if prompt.is_none() {
+                tc.and_then(|t| t.prompt.clone())
+            } else { prompt.clone() };
+            (c, ctx, mt, em, ts, tp)
         } else {
             // No subcommand: restore test params from config file
             let tc = config.test.as_ref();
@@ -236,7 +243,8 @@ fn main() {
             let mt = tc.and_then(|t| t.max_tokens).unwrap_or(256);
             let em = tc.and_then(|t| t.env_monitor).unwrap_or(false);
             let ts = tc.and_then(|t| t.time_slice);
-            (c, ctx, mt, em, ts)
+            let tp = tc.and_then(|t| t.prompt.clone());
+            (c, ctx, mt, em, ts, tp)
         };
 
     let chat_max_tokens = if let Some(Commands::Chat { max_tokens, .. }) = &cli.command {
@@ -250,7 +258,12 @@ fn main() {
     };
 
     let chat_prompt = if let Some(Commands::Chat { prompt, .. }) = &cli.command {
-        prompt.clone()
+        if prompt.is_none() {
+            // Fall back to config file prompt when -p is not given
+            config.chat.as_ref().and_then(|c| c.prompt.clone())
+        } else {
+            prompt.clone()
+        }
     } else {
         // No subcommand: restore chat prompt from config file
         config.chat.as_ref().and_then(|c| c.prompt.clone())
@@ -266,6 +279,7 @@ fn main() {
                     max_tokens: Some(max_tokens_test),
                     env_monitor: Some(env_monitor),
                     time_slice,
+                    prompt: test_prompt.clone(),
                 });
             }
             Some(Commands::Chat { prompt, .. }) => {
@@ -287,14 +301,11 @@ fn main() {
     match &cli.command {
         Some(Commands::Test { .. }) => {
             let ts = time_slice.unwrap_or(config.time_slice_interval);
-            run_tests(config, concurrent, context, max_tokens_test, env_monitor, ts, effective_json);
+            run_tests(config, concurrent, context, max_tokens_test, env_monitor, ts, effective_json, test_prompt);
         }
-        Some(Commands::Chat { prompt, .. }) => {
-            if effective_json {
-                eprintln!("Warning: --json is not supported in chat mode, ignoring");
-            }
-            let prompt_text = prompt.as_ref().map(|p| resolve_prompt(p));
-            chat::run_chat(config, None, prompt_text, chat_max_tokens);
+        Some(Commands::Chat { .. }) => {
+            let prompt_text = chat_prompt.as_ref().map(|p| resolve_prompt(p));
+            chat::run_chat(config, None, prompt_text, chat_max_tokens, effective_json);
         }
         None => {
             // No subcommand: determine mode based on config file
@@ -304,11 +315,11 @@ fn main() {
             if has_chat && !has_test {
                 // chat mode from config
                 let prompt_text = chat_prompt.as_ref().map(|p| resolve_prompt(p));
-                chat::run_chat(config, None, prompt_text, chat_max_tokens);
+                chat::run_chat(config, None, prompt_text, chat_max_tokens, effective_json);
             } else {
                 // default to test mode (includes case where both exist or neither)
                 let ts = time_slice.unwrap_or(config.time_slice_interval);
-                run_tests(config, concurrent, context, max_tokens_test, env_monitor, ts, effective_json);
+                run_tests(config, concurrent, context, max_tokens_test, env_monitor, ts, effective_json, test_prompt);
             }
         }
     }
@@ -337,11 +348,11 @@ fn run_tests(
     env_monitor: bool,
     time_slice_interval: f64,
     json_output: bool,
+    custom_prompt: Option<String>,
 ) {
     let stop_flag = Arc::new(AtomicBool::new(false));
     let stop_notify = Arc::new(Notify::new());
     let lang = config.lang.clone();
-    let model = config.model.clone();
 
     // Setup Ctrl+C handler
     {
@@ -357,6 +368,30 @@ fn run_tests(
     // Parse context sizes
     let context_sizes = test_runner::parse_step_format(&context);
 
+    // Create API client (api_key optional: defaults to empty string)
+    let base_url = config.base_url.as_ref()
+        .expect("API base URL is required (set via --base-url, config file, or environment variable)");
+    let api_key = config.api_key.as_deref().unwrap_or("");
+    let client = ApiClient::new(
+        base_url.clone(),
+        api_key.to_string(),
+        config.timeout.map(Duration::from_secs),
+    );
+
+    let runtime = tokio::runtime::Runtime::new().expect("Failed to create runtime");
+
+    // Resolve model: explicit config > first model from the API > gpt-4 fallback
+    let model = match config.model.clone() {
+        Some(m) => m,
+        None => match runtime.block_on(client.fetch_first_model()) {
+            Some(m) => m,
+            None => {
+                eprintln!("Warning: no model configured and failed to fetch models from API, falling back to \"{}\"", DEFAULT_MODEL);
+                DEFAULT_MODEL.to_string()
+            }
+        },
+    };
+
     if !json_output {
         let (lbl_running, lbl_concurrent, lbl_context, lbl_max_tokens, lbl_model, lbl_slice) = if lang == "zh" {
             ("运行测试", "并发", "上下文大小", "最大Token", "模型", "采样间隔")
@@ -364,33 +399,29 @@ fn run_tests(
             ("Running Tests", "Concurrent", "Context sizes", "Max tokens", "Model", "Slice interval")
         };
 
+        let (lbl_prompt, default_label) = if lang == "zh" {
+            ("提示词", "(默认复述)")
+        } else {
+            ("Prompt", "(default repeat)")
+        };
+
         println!("\n=== {} ===", lbl_running);
         println!("{}: {}", lbl_concurrent, concurrent);
         println!("{}: {:?}", lbl_context, context_sizes);
         println!("{}: {}", lbl_max_tokens, max_tokens);
         println!("{}: {}", lbl_model, model);
+        println!("{}: {}", lbl_prompt, custom_prompt.as_deref().unwrap_or(default_label));
         println!("{}: {}s\n", lbl_slice, time_slice_interval);
     }
 
-    // Create API client
-    let base_url = config.base_url.as_ref()
-        .expect("API base URL is required (set via --base-url, config file, or environment variable)");
-    let api_key = config.api_key.as_ref()
-        .expect("API key is required (set via --api-key, config file, or environment variable)");
-    let client = ApiClient::new(
-        base_url.clone(),
-        api_key.clone(),
-        config.timeout.map(Duration::from_secs),
-    );
-
     // Run tests with live display (suppressed in JSON mode)
-    let runtime = tokio::runtime::Runtime::new().expect("Failed to create runtime");
     let results = runtime.block_on(test_runner::run_live_test(
         client,
         concurrent,
         context_sizes,
         max_tokens,
         model.clone(),
+        custom_prompt,
         stop_flag,
         stop_notify,
         time_slice_interval,

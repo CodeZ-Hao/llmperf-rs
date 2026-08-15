@@ -7,12 +7,17 @@ use std::process::Command;
 /// System-wide default config path on Linux
 const SYSTEM_CONFIG_PATH: &str = "/etc/llmperf-rs/llmperf-rs.yaml";
 
+/// Fallback model used when no model is configured and the API /models
+/// endpoint cannot be reached.
+pub const DEFAULT_MODEL: &str = "gpt-4";
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Config {
     pub base_url: Option<String>,
     pub api_key: Option<String>,
-    #[serde(default = "default_model", alias = "default_model")]
-    pub model: String,
+    /// None = not configured; resolved at runtime from the API's first model
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "default_model")]
+    pub model: Option<String>,
     #[serde(skip)]
     pub lang: String,
     #[serde(default = "default_time_slice")]
@@ -33,6 +38,8 @@ pub struct TestConfig {
     pub max_tokens: Option<u32>,
     pub env_monitor: Option<bool>,
     pub time_slice: Option<f64>,
+    /// Custom prompt appended after the noise prefix (None = default repeat prompt)
+    pub prompt: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default, PartialEq)]
@@ -46,7 +53,7 @@ impl Default for Config {
         Self {
             base_url: None,
             api_key: None,
-            model: default_model(),
+            model: None,
             lang: "en".to_string(),
             time_slice_interval: default_time_slice(),
             timeout: None,
@@ -58,10 +65,6 @@ impl Default for Config {
 
 fn default_time_slice() -> f64 {
     3.0
-}
-
-fn default_model() -> String {
-    "gpt-4".to_string()
 }
 
 /// CLI overrides for config values
@@ -105,10 +108,15 @@ impl Config {
             config.api_key = Some(key.clone());
         }
 
-        // If still missing credentials, prompt interactively
-        if config.base_url.is_none() || config.api_key.is_none() {
+        // If base URL is still missing, prompt interactively (first run)
+        if config.base_url.is_none() {
             Self::prompt_credentials(&mut config)?;
             Self::ask_save_config(&config)?;
+        }
+
+        // api_key is optional: default to empty string, never prompt for it
+        if config.api_key.is_none() {
+            config.api_key = Some(String::new());
         }
 
         Ok(config)
@@ -125,18 +133,6 @@ impl Config {
             io::stdin().read_line(&mut input).unwrap();
             let input = input.trim();
             config.base_url = Some(if input.is_empty() { default_url.to_string() } else { input.to_string() });
-        }
-        if config.api_key.is_none() {
-            print!("API Key: ");
-            io::stdout().flush().unwrap();
-            let mut input = String::new();
-            io::stdin().read_line(&mut input).unwrap();
-            let input = input.trim().to_string();
-            if input.is_empty() {
-                let msg = if lang == "zh" { "API Key 不能为空" } else { "API Key is required" };
-                return Err(msg.to_string());
-            }
-            config.api_key = Some(input);
         }
         Ok(())
     }
@@ -241,7 +237,7 @@ mod tests {
         let config = Config {
             base_url: Some("https://api.example.com/v1".to_string()),
             api_key: Some("sk-test123".to_string()),
-            model: "gpt-4".to_string(),
+            model: Some("gpt-4".to_string()),
             lang: "en".to_string(),
             time_slice_interval: 3.0,
             timeout: Some(60),
@@ -251,6 +247,7 @@ mod tests {
                 max_tokens: Some(128),
                 env_monitor: Some(false),
                 time_slice: None,
+                prompt: None,
             }),
             chat: Some(ChatConfig {
                 max_tokens: Some(1024),
@@ -286,7 +283,7 @@ chat:
 
         assert_eq!(config.base_url, Some("https://api.example.com/v1".to_string()));
         assert_eq!(config.api_key, Some("sk-test123".to_string()));
-        assert_eq!(config.model, "gpt-4");
+        assert_eq!(config.model, Some("gpt-4".to_string())); // explicit in yaml
 
         let test_config = config.test.unwrap();
         assert_eq!(test_config.concurrent, Some(4));
@@ -308,7 +305,7 @@ api_key: "sk-test123"
 
         assert_eq!(config.base_url, Some("https://api.example.com/v1".to_string()));
         assert_eq!(config.api_key, Some("sk-test123".to_string()));
-        assert_eq!(config.model, "gpt-4"); // default
+        assert_eq!(config.model, None); // not configured -> resolved from API at runtime
         assert_eq!(config.test, None);
         assert_eq!(config.chat, None);
     }
