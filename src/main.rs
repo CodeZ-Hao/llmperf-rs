@@ -81,7 +81,8 @@ enum Commands {
         #[arg(short, long)]
         env_monitor: bool,
 
-        /// Time slice interval in seconds for real-time display
+        /// Statistics sampling interval in seconds — stats accumulate from test
+        /// start and are only refreshed (never reset) at this cadence
         #[arg(long)]
         time_slice: Option<f64>,
 
@@ -430,7 +431,7 @@ fn run_tests(
         let (lbl_running, lbl_concurrent, lbl_context, lbl_max_tokens, lbl_model, lbl_slice) = if lang == "zh" {
             ("运行测试", "并发", "上下文大小", "最大Token", "模型", "采样间隔")
         } else {
-            ("Running Tests", "Concurrent", "Context sizes", "Max tokens", "Model", "Slice interval")
+            ("Running Tests", "Concurrent", "Context sizes", "Max tokens", "Model", "Refresh interval")
         };
 
         let (lbl_prompt, default_label) = if lang == "zh" {

@@ -10,7 +10,7 @@ LLM API Testing CLI Tool - 用于测试 LLM API 性能的命令行工具。
 ## 功能特性
 
 - 支持 OpenAI API 兼容的 LLM API 测试
-- 实时时间片采样，终端表格动态显示每个请求的吞吐量
+- 实时统计采样（累计统计、定时刷新），终端表格动态显示每个请求的吞吐量
 - 并发请求测试，系统级吞吐量统计
 - 提示词由「随机前缀 + 噪声填充 + 自定义提示词」组成：随机前缀破除前缀缓存，噪声按 `-c` 目标长度自动扣减提示词与固定开销，最终统计以服务端回传的真实输入/输出 tokens 为准
 - 多种上下文大小测试（支持范围格式）
@@ -56,7 +56,7 @@ cargo build --release
 | `api_key` | String | 否 | 空字符串 | API 密钥（可省略，省略时使用空字符串） |
 | `model` | String | 否 | API 第一个模型 | 默认模型（未配置时自动从 `GET /models` 取第一个模型，失败回退 `gpt-4`；也支持 `default_model` 键） |
 | `lang` | String | 否 | `en` | 输出语言 `zh` / `en` |
-| `time_slice_interval` | Float | 否 | `3.0` | 时间片采样间隔（秒） |
+| `time_slice_interval` | Float | 否 | `3.0` | 统计采样间隔（秒），统计自测试开始累计，仅定时刷新不重置 |
 | `timeout` | Integer | 否 | 无 | 请求超时时间（秒），不设置则不限制 |
 
 #### test 子配置
@@ -68,7 +68,7 @@ cargo build --release
 | `prompt` | String | 自定义提示词（默认使用复述提示词） |
 | `max_tokens` | Integer | 最大生成 token 数 |
 | `env_monitor` | Boolean | 是否输出环境信息 |
-| `time_slice` | Float | 时间片采样间隔 |
+| `time_slice` | Float | 统计采样间隔（秒） |
 | `enable_thinking` | Boolean | 开启/关闭思考（默认 `false`，通过请求体 `chat_template_kwargs: {"thinking": ..., "enable_thinking": ...}` 传给服务端（兼容 DeepSeek V4 与 Qwen3 两类模板）） |
 
 #### chat 子配置
@@ -132,7 +132,7 @@ llmperf-rs test [OPTIONS]
 | `--max-tokens <NUM>` | - | `256` | 最大生成 token 数 |
 | `--model <MODEL>` | `-m` | 配置文件默认值 | 测试模型 |
 | `--env-monitor` | `-e` | `false` | 输出环境信息 |
-| `--time-slice <SECS>` | - | `3.0` | 时间片采样间隔（秒） |
+| `--time-slice <SECS>` | - | `3.0` | 统计采样间隔（秒），累计统计定时刷新 |
 | `--thinking` / `--no-thinking` | - | 关闭 | 开启/关闭思考（同时指定时后者生效；覆盖配置文件；请求体为 `chat_template_kwargs: {"thinking": ..., "enable_thinking": ...}`） |
 | `--timeout <SECONDS>` | - | 不限制 | 请求超时时间（秒） |
 | `--json` | - | `false` | 以 JSON 格式输出结果 |

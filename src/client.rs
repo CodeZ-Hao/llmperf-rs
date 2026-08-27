@@ -22,19 +22,26 @@ pub enum TokenEvent {
         request_id: usize,
         time: Instant,
     },
-    /// A chunk of output tokens received
+    /// A chunk of output content received (token counts are derived from the
+    /// accumulated text — per-chunk tokenization overestimates on partial tokens)
     TokensReceived {
         request_id: usize,
         #[allow(dead_code)]
         time: Instant,
-        token_count: u32,
+        content: String,
     },
     /// Request completed
     Completed {
         request_id: usize,
         time: Instant,
+        /// Server-reported completion tokens (from the final chunk's usage
+        /// block). 0 when the server did not report usage — the display falls
+        /// back to counting the accumulated text locally.
         completion_tokens: u32,
         prompt_tokens: u32,
+        /// Whether completion_tokens comes from the server's usage block
+        /// (authoritative, model-tokenizer count) or is unset (server_usage=false)
+        server_usage: bool,
         success: bool,
         error: Option<String>,
     },
@@ -190,18 +197,21 @@ fn parse_sse_line(line: &str) -> Option<SseDelta> {
     Some(SseDelta { content, usage })
 }
 
-/// Process buffered bytes into SSE deltas, calling handler for each
-fn process_sse_buffer<F>(buffer: &mut String, bytes: &[u8], mut handler: F)
+/// Process buffered bytes into SSE deltas, calling handler for each.
+/// The buffer holds raw bytes: TCP chunks can split a multi-byte UTF-8
+/// character, so conversion happens only on complete lines. A line is
+/// always valid UTF-8 — '\n' (0x0A) can never appear inside a multi-byte
+/// character, so no content is dropped at chunk boundaries.
+fn process_sse_buffer<F>(buffer: &mut Vec<u8>, bytes: &[u8], mut handler: F)
 where
     F: FnMut(SseDelta),
 {
-    if let Ok(text) = String::from_utf8(bytes.to_vec()) {
-        buffer.push_str(&text);
-        while let Some(pos) = buffer.find('\n') {
-            let line = buffer.drain(..pos + 1).collect::<String>();
-            if let Some(delta) = parse_sse_line(&line) {
-                handler(delta);
-            }
+    buffer.extend_from_slice(bytes);
+    while let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
+        let line = buffer.drain(..=pos).collect::<Vec<u8>>();
+        let line = String::from_utf8_lossy(&line);
+        if let Some(delta) = parse_sse_line(&line) {
+            handler(delta);
         }
     }
 }
@@ -300,6 +310,7 @@ impl ApiClient {
                     time: Instant::now(),
                     completion_tokens: 0,
                     prompt_tokens,
+                    server_usage: false,
                     success: false,
                     error: Some(format!("Request failed: {}", e)),
                 });
@@ -315,6 +326,7 @@ impl ApiClient {
                 time: Instant::now(),
                 completion_tokens: 0,
                 prompt_tokens,
+                server_usage: false,
                 success: false,
                 error: Some(format!("HTTP {}: {}", status, error_text)),
             });
@@ -322,9 +334,8 @@ impl ApiClient {
         }
 
         let mut stream = response.bytes_stream();
-        let mut buffer = String::new();
+        let mut buffer: Vec<u8> = Vec::new();
         let mut first_token_sent = false;
-        let mut output_token_count: u32 = 0;
         let mut server_completion_tokens: Option<u32> = None;
         let mut server_prompt_tokens: Option<u32> = None;
 
@@ -332,12 +343,12 @@ impl ApiClient {
             let chunk = tokio::select! {
                 c = stream.next() => c,
                 _ = wait_stop(&stop_notify) => {
-                    let final_tokens = server_completion_tokens.unwrap_or(output_token_count);
                     let _ = tx.send(TokenEvent::Completed {
                         request_id,
                         time: Instant::now(),
-                        completion_tokens: final_tokens,
+                        completion_tokens: server_completion_tokens.unwrap_or(0),
                         prompt_tokens: server_prompt_tokens.unwrap_or(prompt_tokens),
+                        server_usage: server_completion_tokens.is_some(),
                         success: false,
                         error: Some("interrupted".to_string()),
                     });
@@ -364,13 +375,10 @@ impl ApiClient {
                                         eprintln!("[req {}] event channel closed during FirstToken", request_id);
                                     }
                                 }
-                                let chunk_tokens = count_tokens(&content) as u32;
-                                let chunk_tokens = chunk_tokens.max(1);
-                                output_token_count += chunk_tokens;
                                 if tx.send(TokenEvent::TokensReceived {
                                     request_id,
                                     time: now,
-                                    token_count: chunk_tokens,
+                                    content,
                                 }).is_err() {
                                     eprintln!("[req {}] event channel closed during TokensReceived", request_id);
                                 }
@@ -382,8 +390,9 @@ impl ApiClient {
                     let _ = tx.send(TokenEvent::Completed {
                         request_id,
                         time: Instant::now(),
-                        completion_tokens: server_completion_tokens.unwrap_or(output_token_count),
+                        completion_tokens: server_completion_tokens.unwrap_or(0),
                         prompt_tokens: server_prompt_tokens.unwrap_or(prompt_tokens),
+                        server_usage: server_completion_tokens.is_some(),
                         success: false,
                         error: Some(format!("Stream error: {}", e)),
                     });
@@ -396,16 +405,16 @@ impl ApiClient {
             }
         }
 
-        // Prefer server-reported usage (real tokenizer counts); local estimates
-        // (tiktoken / char heuristics) only serve as fallback when the server
-        // does not return usage in the stream.
-        let final_tokens = server_completion_tokens.unwrap_or(output_token_count);
+        // Server-reported usage (real tokenizer count) is authoritative; when the
+        // server does not report it (completion_tokens = 0, server_usage = false),
+        // the display falls back to counting the accumulated text locally.
         let final_prompt_tokens = server_prompt_tokens.unwrap_or(prompt_tokens);
         let _ = tx.send(TokenEvent::Completed {
             request_id,
             time: Instant::now(),
-            completion_tokens: final_tokens,
+            completion_tokens: server_completion_tokens.unwrap_or(0),
             prompt_tokens: final_prompt_tokens,
+            server_usage: server_completion_tokens.is_some(),
             success: true,
             error: None,
         });
@@ -496,7 +505,7 @@ impl ApiClient {
         let mut full_content = String::new();
         let mut first_token_time: Option<std::time::Duration> = None;
         let mut last_token_time: Option<std::time::Duration> = None;
-        let mut buffer = String::new();
+        let mut buffer: Vec<u8> = Vec::new();
         let mut server_completion_tokens: Option<u32> = None;
         let mut server_prompt_tokens: Option<u32> = None;
 
@@ -524,11 +533,12 @@ impl ApiClient {
             });
         }
 
-        // Use server-provided tokens if available, otherwise estimate
+        // Use server-provided tokens if available, otherwise count the full
+        // accumulated text once (per-chunk estimates inflate on partial tokens)
         let prompt_tokens = server_prompt_tokens
             .unwrap_or(local_prompt_tokens);
         let output_tokens = server_completion_tokens
-            .unwrap_or_else(|| (full_content.len() / 4) as u32);
+            .unwrap_or_else(|| count_tokens(&full_content) as u32);
 
         // Calculate prefill speed
         let prefill_tps = first_token_time.map(|d| {
@@ -609,7 +619,7 @@ mod tests {
 
     #[test]
     fn test_process_sse_buffer_multiline() {
-        let mut buffer = String::new();
+        let mut buffer: Vec<u8> = Vec::new();
         let input = "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\ndata: {\"choices\":[{\"delta\":{\"content\":\"b\"}}]}\n";
         let mut contents = Vec::new();
         process_sse_buffer(&mut buffer, input.as_bytes(), |delta| {
@@ -618,5 +628,37 @@ mod tests {
             }
         });
         assert_eq!(contents, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn test_process_sse_buffer_split_multibyte() {
+        // A multi-byte UTF-8 char (中 = E4 B8 AD) split across TCP chunks must
+        // not be dropped: the buffer holds raw bytes until a complete line
+        // (terminated by '\n') is available, so the char reassembles correctly.
+        let mut buffer: Vec<u8> = Vec::new();
+        let prefix = b"data: {\"choices\":[{\"delta\":{\"content\":\"";
+        let suffix = b"\"}}]}\n";
+        let mut contents = Vec::new();
+
+        // Chunk 1: line up to the first two bytes of 中 (E4 B8), no newline yet
+        let mut chunk1 = prefix.to_vec();
+        chunk1.extend_from_slice(&[0xE4, 0xB8]);
+        process_sse_buffer(&mut buffer, &chunk1, |d| {
+            if let Some(c) = d.content {
+                contents.push(c);
+            }
+        });
+        assert!(contents.is_empty(), "partial line must not be parsed yet");
+
+        // Chunk 2: the tail byte of 中 (AD) + 好 (E5 A5 BD) + line terminator
+        let mut chunk2: Vec<u8> = vec![0xAD, 0xE5, 0xA5, 0xBD];
+        chunk2.extend_from_slice(suffix);
+        process_sse_buffer(&mut buffer, &chunk2, |d| {
+            if let Some(c) = d.content {
+                contents.push(c);
+            }
+        });
+
+        assert_eq!(contents, vec!["中好"]);
     }
 }

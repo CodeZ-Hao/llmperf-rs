@@ -10,7 +10,7 @@ Supports concurrent testing with maximum output, JSON format output, quick testi
 ## Features
 
 - Support for OpenAI API-compatible LLM API testing
-- Real-time time-slice sampling with dynamic terminal table showing throughput per request
+- Real-time stats sampling (cumulative, periodically refreshed) with dynamic terminal table showing throughput per request
 - Concurrent request testing with system-level throughput statistics
 - Prompt built from "random nonce + noise filler + custom prompt": the nonce defeats prefix caching, the noise automatically targets the `-c` length (subtracting the custom prompt and fixed overhead), and final stats use the server-reported input/output tokens
 - Multiple context size testing (supports range format)
@@ -56,7 +56,7 @@ On first run, if config file doesn't exist:
 | `api_key` | String | No | empty string | API key (optional; empty string is used when omitted) |
 | `model` | String | No | first model from API | Default model (when unset, auto-fetches the first model from `GET /models`, falling back to `gpt-4` on failure; also supports `default_model` key) |
 | `lang` | String | No | `en` | Output language `zh` / `en` |
-| `time_slice_interval` | Float | No | `3.0` | Time slice sampling interval (seconds) |
+| `time_slice_interval` | Float | No | `3.0` | Stats sampling interval (seconds); stats accumulate from test start, refreshed only, never reset |
 | `timeout` | Integer | No | none | Request timeout (seconds); unlimited if unset |
 
 #### test sub-config
@@ -68,7 +68,7 @@ On first run, if config file doesn't exist:
 | `prompt` | String | Custom prompt (defaults to the repeat prompt) |
 | `max_tokens` | Integer | Max tokens to generate |
 | `env_monitor` | Boolean | Whether to output environment info |
-| `time_slice` | Float | Time slice sampling interval |
+| `time_slice` | Float | Stats sampling interval (seconds) |
 | `enable_thinking` | Boolean | Enable/disable thinking (default `false`; sent as `chat_template_kwargs: {"thinking": ..., "enable_thinking": ...}` in the request body (covers both DeepSeek V4 and Qwen3-style templates)) |
 
 #### chat sub-config
@@ -132,7 +132,7 @@ llmperf-rs test [OPTIONS]
 | `--max-tokens <NUM>` | - | `256` | Max tokens to generate |
 | `--model <MODEL>` | `-m` | Config default | Test model |
 | `--env-monitor` | `-e` | `false` | Output environment info |
-| `--time-slice <SECS>` | - | `3.0` | Time slice sampling interval (seconds) |
+| `--time-slice <SECS>` | - | `3.0` | Stats sampling interval (seconds); cumulative stats refreshed periodically |
 | `--thinking` / `--no-thinking` | - | off | Enable/disable thinking (last one wins; overrides config; sent as `chat_template_kwargs: {"thinking": ..., "enable_thinking": ...}`) |
 | `--timeout <SECONDS>` | - | no limit | Request timeout (seconds) |
 | `--json` | - | `false` | Output results in JSON format |

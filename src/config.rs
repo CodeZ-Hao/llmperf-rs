@@ -20,6 +20,8 @@ pub struct Config {
     pub model: Option<String>,
     #[serde(skip)]
     pub lang: String,
+    /// Statistics sampling interval in seconds — stats accumulate from test
+    /// start and are only refreshed (never reset) at this cadence
     #[serde(default = "default_time_slice")]
     pub time_slice_interval: f64,
     /// Request timeout in seconds (None = no limit)
@@ -37,6 +39,7 @@ pub struct TestConfig {
     pub context: Option<String>,
     pub max_tokens: Option<u32>,
     pub env_monitor: Option<bool>,
+    /// Statistics sampling interval (seconds), same semantics as time_slice_interval
     pub time_slice: Option<f64>,
     /// Custom prompt appended after the noise prefix (None = default repeat prompt)
     pub prompt: Option<String>,
