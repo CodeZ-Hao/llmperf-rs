@@ -17,6 +17,7 @@ pub async fn run_live_test(
     stop_flag: Arc<AtomicBool>,
     stop_notify: Arc<Notify>,
     time_slice_secs: f64,
+    enable_thinking: bool,
     lang: &str,
     silent: bool,
 ) -> Vec<LiveTestResult> {
@@ -51,7 +52,7 @@ pub async fn run_live_test(
                     None => break, // queue closed, no more requests
                 };
                 let prompt = build_test_prompt(ctx, task_prompt.as_deref());
-                client.test_streaming_with_events(rid, &model, &prompt, max_tokens, ctx, ctx, tx.clone(), sn.clone()).await;
+                client.test_streaming_with_events(rid, &model, &prompt, max_tokens, ctx, ctx, tx.clone(), sn.clone(), enable_thinking).await;
             }
         });
     }

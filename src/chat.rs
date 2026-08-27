@@ -4,7 +4,7 @@ use serde_json::json;
 use std::io::{self, Write};
 use std::time::Duration;
 
-pub fn run_chat(config: Config, model: Option<String>, initial_prompt: Option<String>, max_tokens: u32, json_output: bool) {
+pub fn run_chat(config: Config, model: Option<String>, initial_prompt: Option<String>, max_tokens: u32, json_output: bool, enable_thinking: bool) {
     let model = model.or(config.model);
     let client = ApiClient::new(
         config.base_url.unwrap(),
@@ -36,29 +36,37 @@ pub fn run_chat(config: Config, model: Option<String>, initial_prompt: Option<St
                 std::process::exit(1);
             }
         };
-        run_one_shot(&client, &model, &prompt_text, max_tokens, &lang, json_output, &runtime);
+        run_one_shot(&client, &model, &prompt_text, max_tokens, &lang, json_output, &runtime, enable_thinking);
         return;
     }
 
     // Interactive mode
-    let (help_cmd, help_clear, help_exit, help_error, lbl_user, lbl_ai,
+    let (help_cmd, help_clear, help_exit, help_error, help_think, lbl_user, lbl_ai,
          lbl_prefill, lbl_decode, lbl_stats) = if lang == "zh" {
-        ("帮助", "清空对话历史", "退出聊天", "错误",
+        ("帮助", "清空对话历史", "退出聊天", "错误", "开关思考",
          "用户", "AI", "Prefill", "Decode", "统计信息")
     } else {
-        ("help", "Clear conversation", "Exit chat", "Error",
+        ("help", "Clear conversation", "Exit chat", "Error", "Toggle thinking",
          "You", "AI", "Prefill", "Decode", "Statistics")
     };
 
     println!("\n=== Chat Mode ===");
     println!("Model: {}", model);
+    let (lbl_thinking, state) = if lang == "zh" {
+        ("思考", if enable_thinking { "开启" } else { "关闭" })
+    } else {
+        ("Thinking", if enable_thinking { "on" } else { "off" })
+    };
+    println!("{}: {}", lbl_thinking, state);
     println!("Commands:");
     println!("  /clear - {}", help_clear);
     println!("  /exit  - {}", help_exit);
     println!("  /help  - {}", help_cmd);
+    println!("  /think - {}", help_think);
     println!("-----------\n");
 
     let mut messages: Vec<(String, String)> = Vec::new();
+    let mut enable_thinking = enable_thinking;
 
     loop {
         print!("\n{} ", lbl_user);
@@ -87,6 +95,18 @@ pub fn run_chat(config: Config, model: Option<String>, initial_prompt: Option<St
                     println!("  /clear - {}", help_clear);
                     println!("  /exit  - {}", help_exit);
                     println!("  /help  - {}", help_cmd);
+                    println!("  /think - {}", help_think);
+                    continue;
+                }
+                "/think" => {
+                    // Toggle thinking state
+                    enable_thinking = !enable_thinking;
+                    let (lbl_thinking, state) = if lang == "zh" {
+                        ("思考", if enable_thinking { "开启" } else { "关闭" })
+                    } else {
+                        ("Thinking", if enable_thinking { "on" } else { "off" })
+                    };
+                    println!("{}: {}", lbl_thinking, state);
                     continue;
                 }
                 _ => {
@@ -115,7 +135,7 @@ pub fn run_chat(config: Config, model: Option<String>, initial_prompt: Option<St
         io::stdout().flush().unwrap();
 
         let result = runtime.block_on(
-            client.chat_streaming(&model, chat_messages, max_tokens, |chunk| {
+            client.chat_streaming(&model, chat_messages, max_tokens, enable_thinking, |chunk| {
                 print!("{}", chunk);
                 io::stdout().flush().unwrap();
             })
@@ -151,6 +171,7 @@ fn run_one_shot(
     lang: &str,
     json_output: bool,
     runtime: &tokio::runtime::Runtime,
+    enable_thinking: bool,
 ) {
     let (lbl_user, lbl_ai, lbl_stats, lbl_prefill, lbl_decode) = if lang == "zh" {
         ("用户", "AI", "统计信息", "Prefill", "Decode")
@@ -170,7 +191,7 @@ fn run_one_shot(
     }];
 
     let result = runtime.block_on(
-        client.chat_streaming(model, chat_messages, max_tokens, |chunk| {
+        client.chat_streaming(model, chat_messages, max_tokens, enable_thinking, |chunk| {
             if !json_output {
                 print!("{}", chunk);
                 io::stdout().flush().unwrap();

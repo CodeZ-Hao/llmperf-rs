@@ -40,12 +40,16 @@ pub struct TestConfig {
     pub time_slice: Option<f64>,
     /// Custom prompt appended after the noise prefix (None = default repeat prompt)
     pub prompt: Option<String>,
+    /// Enable/disable thinking (None = server default)
+    pub enable_thinking: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default, PartialEq)]
 pub struct ChatConfig {
     pub max_tokens: Option<u32>,
     pub prompt: Option<String>,
+    /// Enable/disable thinking (None = server default)
+    pub enable_thinking: Option<bool>,
 }
 
 impl Default for Config {
@@ -248,10 +252,12 @@ mod tests {
                 env_monitor: Some(false),
                 time_slice: None,
                 prompt: None,
+                enable_thinking: Some(false),
             }),
             chat: Some(ChatConfig {
                 max_tokens: Some(1024),
                 prompt: Some("hello".to_string()),
+                enable_thinking: Some(true),
             }),
         };
 
@@ -274,10 +280,12 @@ test:
   concurrent: 4
   context: "4096"
   max_tokens: 128
+  enable_thinking: false
 
 chat:
   max_tokens: 1024
   prompt: "hello"
+  enable_thinking: true
 "#;
         let config: Config = serde_yaml::from_str(yaml).unwrap();
 
@@ -289,10 +297,12 @@ chat:
         assert_eq!(test_config.concurrent, Some(4));
         assert_eq!(test_config.context, Some("4096".to_string()));
         assert_eq!(test_config.max_tokens, Some(128));
+        assert_eq!(test_config.enable_thinking, Some(false));
 
         let chat_config = config.chat.unwrap();
         assert_eq!(chat_config.max_tokens, Some(1024));
         assert_eq!(chat_config.prompt, Some("hello".to_string()));
+        assert_eq!(chat_config.enable_thinking, Some(true));
     }
 
     #[test]

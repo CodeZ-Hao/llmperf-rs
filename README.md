@@ -69,6 +69,7 @@ cargo build --release
 | `max_tokens` | Integer | 最大生成 token 数 |
 | `env_monitor` | Boolean | 是否输出环境信息 |
 | `time_slice` | Float | 时间片采样间隔 |
+| `enable_thinking` | Boolean | 开启/关闭思考（默认 `false`，通过请求体 `chat_template_kwargs: {"thinking": ..., "enable_thinking": ...}` 传给服务端（兼容 DeepSeek V4 与 Qwen3 两类模板）） |
 
 #### chat 子配置
 
@@ -76,6 +77,7 @@ cargo build --release
 |------|------|------|
 | `max_tokens` | Integer | 每次回复最大 token 数 |
 | `prompt` | String | 初始 prompt |
+| `enable_thinking` | Boolean | 开启/关闭思考（默认 `false`，通过请求体 `chat_template_kwargs: {"thinking": ..., "enable_thinking": ...}` 传给服务端（兼容 DeepSeek V4 与 Qwen3 两类模板）） |
 
 ### 配置示例
 
@@ -90,10 +92,12 @@ test:
   concurrent: 4
   context: "4096"
   max_tokens: 128
+  enable_thinking: false
 
 chat:
   max_tokens: 1024
   prompt: "你是一个助手"
+  enable_thinking: false
 ```
 
 ## 使用方法
@@ -129,6 +133,7 @@ llmperf-rs test [OPTIONS]
 | `--model <MODEL>` | `-m` | 配置文件默认值 | 测试模型 |
 | `--env-monitor` | `-e` | `false` | 输出环境信息 |
 | `--time-slice <SECS>` | - | `3.0` | 时间片采样间隔（秒） |
+| `--thinking` / `--no-thinking` | - | 关闭 | 开启/关闭思考（同时指定时后者生效；覆盖配置文件；请求体为 `chat_template_kwargs: {"thinking": ..., "enable_thinking": ...}`） |
 | `--timeout <SECONDS>` | - | 不限制 | 请求超时时间（秒） |
 | `--json` | - | `false` | 以 JSON 格式输出结果 |
 | `--lang <LANG>` | - | 自动检测 | 输出语言 (zh/en) |
@@ -145,6 +150,9 @@ llmperf-rs test -j 4 -c 1024:1024:4096
 
 # 自定义提示词（提示词总长度仍按 -c 控制，噪声前缀自动扣除提示词与固定开销的 token 数）
 llmperf-rs test -j 2 -c 4096 -p "请总结上述文本"
+
+# 开启思考（默认关闭；适合测试 Qwen3 等思考模型的推理性能）
+llmperf-rs test -j 2 -c 4096 --thinking
 
 # 指定模型和 API 地址（api-key 可省略，省略时使用空字符串）
 llmperf-rs test -m qwen-plus --base-url https://api.example.com/v1 --api-key sk-xxx
@@ -175,6 +183,7 @@ llmperf-rs chat [OPTIONS]
 | `--model <MODEL>` | `-m` | 配置文件默认值 | 聊天模型 |
 | `--prompt <TEXT>` | `-p` | - | 提供时进入一击模式：流式打印生成结果后输出吞吐统计，不进入交互循环。支持 `@filepath` 从文件读取 |
 | `--max-tokens <NUM>` | - | `1024` | 每次回复最大 token 数 |
+| `--thinking` / `--no-thinking` | - | 关闭 | 开启/关闭思考（同时指定时后者生效；覆盖配置文件；交互模式中可用 `/think` 随时切换；请求体为 `chat_template_kwargs: {"thinking": ..., "enable_thinking": ...}`） |
 | `--json` | - | `false` | 一击模式下以 JSON 输出结果（不流式打印；prompt 缺失时需 `-p` 或配置文件 `chat.prompt`） |
 | `--timeout <SECONDS>` | - | 不限制 | 请求超时时间（秒） |
 | `--lang <LANG>` | - | 自动检测 | 输出语言 (zh/en) |
@@ -195,6 +204,9 @@ llmperf-rs chat -p "请解释量子计算"
 # 一击模式 + JSON 输出（适合脚本调用）
 llmperf-rs chat -p "请解释量子计算" --json
 
+# 开启思考（默认关闭）
+llmperf-rs chat -p "请解释量子计算" --thinking
+
 # 从文件读取 prompt
 llmperf-rs chat -p @prompt.txt
 
@@ -205,7 +217,7 @@ llmperf-rs chat -p "hello" --save-config chat.yaml
 llmperf-rs --config chat.yaml
 ```
 
-交互模式内置命令：`/clear` 清空历史、`/exit` 退出、`/help` 帮助。
+交互模式内置命令：`/clear` 清空历史、`/exit` 退出、`/help` 帮助、`/think` 开关思考。
 
 ## 输出说明
 

@@ -84,11 +84,22 @@ struct ChatRequest {
     stream: bool,
     #[serde(default)]
     stream_options: Option<StreamOptions>,
+    /// Passed to the server's chat template, used to toggle model thinking.
+    /// Both common keys are sent so it works across serving stacks:
+    /// - `thinking`: DeepSeek V4 style (SGLang, e.g. deepseek-v4-flash)
+    /// - `enable_thinking`: Qwen3 style (llama.cpp / vLLM / DashScope)
+    chat_template_kwargs: ChatTemplateKwargs,
 }
 
 #[derive(Debug, Serialize)]
 struct StreamOptions {
     include_usage: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatTemplateKwargs {
+    thinking: bool,
+    enable_thinking: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -245,6 +256,7 @@ impl ApiClient {
         context_size: u32,
         tx: mpsc::UnboundedSender<TokenEvent>,
         stop_notify: Arc<Notify>,
+        enable_thinking: bool,
     ) {
         let start = Instant::now();
 
@@ -268,6 +280,7 @@ impl ApiClient {
             temperature: 0.7,
             stream: true,
             stream_options: Some(StreamOptions { include_usage: true }),
+            chat_template_kwargs: ChatTemplateKwargs { thinking: enable_thinking, enable_thinking },
         };
 
         let url = format!("{}/chat/completions", self.base_url);
@@ -431,6 +444,7 @@ impl ApiClient {
         model: &str,
         messages: Vec<ChatMessage>,
         max_tokens: u32,
+        enable_thinking: bool,
         mut on_chunk: F,
     ) -> Result<ChatStreamResult, String>
     where
@@ -454,6 +468,7 @@ impl ApiClient {
             stream_options: Some(StreamOptions {
                 include_usage: true,
             }),
+            chat_template_kwargs: ChatTemplateKwargs { thinking: enable_thinking, enable_thinking },
         };
 
         let url = format!("{}/chat/completions", self.base_url);

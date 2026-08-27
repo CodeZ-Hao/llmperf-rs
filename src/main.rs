@@ -85,6 +85,14 @@ enum Commands {
         #[arg(long)]
         time_slice: Option<f64>,
 
+        /// Enable thinking (default: off; last flag wins; overrides config)
+        #[arg(long, action = clap::ArgAction::SetTrue, overrides_with = "no_thinking")]
+        thinking: bool,
+
+        /// Disable thinking (default; last flag wins; overrides config)
+        #[arg(long, overrides_with = "thinking")]
+        no_thinking: bool,
+
         // --- inherited base params (subcommand overrides base) ---
 
         /// Model to test (overrides base -m)
@@ -125,6 +133,14 @@ enum Commands {
         /// Max tokens per response
         #[arg(long, default_value = "1024")]
         max_tokens: u32,
+
+        /// Enable thinking (default: off; last flag wins; overrides config)
+        #[arg(long, action = clap::ArgAction::SetTrue, overrides_with = "no_thinking")]
+        thinking: bool,
+
+        /// Disable thinking (default; last flag wins; overrides config)
+        #[arg(long, overrides_with = "thinking")]
+        no_thinking: bool,
 
         // --- inherited base params (subcommand overrides base) ---
 
@@ -212,8 +228,8 @@ fn main() {
     // Merge config file defaults into subcommand params via value_source
     let sub_matches = matches.subcommand().map(|(_, m)| m);
 
-    let (concurrent, context, max_tokens_test, env_monitor, time_slice, test_prompt) =
-        if let Some(Commands::Test { concurrent, context, max_tokens, env_monitor, time_slice, prompt, .. }) = &cli.command {
+    let (concurrent, context, max_tokens_test, env_monitor, time_slice, test_prompt, test_thinking) =
+        if let Some(Commands::Test { concurrent, context, max_tokens, env_monitor, time_slice, prompt, thinking, no_thinking, .. }) = &cli.command {
             let tc = config.test.as_ref();
             let sm = sub_matches.unwrap();
             let c = if sm.value_source("concurrent") == Some(clap::parser::ValueSource::DefaultValue) {
@@ -234,7 +250,11 @@ fn main() {
             let tp = if prompt.is_none() {
                 tc.and_then(|t| t.prompt.clone())
             } else { prompt.clone() };
-            (c, ctx, mt, em, ts, tp)
+            // CLI flags win over config; neither set -> thinking off by default
+            let tt = if *thinking { true } else if *no_thinking { false } else {
+                tc.and_then(|t| t.enable_thinking).unwrap_or(false)
+            };
+            (c, ctx, mt, em, ts, tp, tt)
         } else {
             // No subcommand: restore test params from config file
             let tc = config.test.as_ref();
@@ -244,7 +264,8 @@ fn main() {
             let em = tc.and_then(|t| t.env_monitor).unwrap_or(false);
             let ts = tc.and_then(|t| t.time_slice);
             let tp = tc.and_then(|t| t.prompt.clone());
-            (c, ctx, mt, em, ts, tp)
+            let tt = tc.and_then(|t| t.enable_thinking).unwrap_or(false);
+            (c, ctx, mt, em, ts, tp, tt)
         };
 
     let chat_max_tokens = if let Some(Commands::Chat { max_tokens, .. }) = &cli.command {
@@ -269,6 +290,16 @@ fn main() {
         config.chat.as_ref().and_then(|c| c.prompt.clone())
     };
 
+    let chat_thinking = if let Some(Commands::Chat { thinking, no_thinking, .. }) = &cli.command {
+        if *thinking { true } else if *no_thinking { false } else {
+            // No CLI flag: fall back to config file, default thinking off
+            config.chat.as_ref().and_then(|c| c.enable_thinking).unwrap_or(false)
+        }
+    } else {
+        // No subcommand: restore chat thinking from config file, default off
+        config.chat.as_ref().and_then(|c| c.enable_thinking).unwrap_or(false)
+    };
+
     // --save-config: serialize current effective config and exit
     if let Some(save_path) = &effective_save_config {
         match &cli.command {
@@ -280,12 +311,14 @@ fn main() {
                     env_monitor: Some(env_monitor),
                     time_slice,
                     prompt: test_prompt.clone(),
+                    enable_thinking: Some(test_thinking),
                 });
             }
             Some(Commands::Chat { prompt, .. }) => {
                 config.chat = Some(ChatConfig {
                     max_tokens: Some(chat_max_tokens),
                     prompt: prompt.clone(),
+                    enable_thinking: Some(chat_thinking),
                 });
             }
             None => {}
@@ -301,11 +334,11 @@ fn main() {
     match &cli.command {
         Some(Commands::Test { .. }) => {
             let ts = time_slice.unwrap_or(config.time_slice_interval);
-            run_tests(config, concurrent, context, max_tokens_test, env_monitor, ts, effective_json, test_prompt);
+            run_tests(config, concurrent, context, max_tokens_test, env_monitor, ts, effective_json, test_prompt, test_thinking);
         }
         Some(Commands::Chat { .. }) => {
             let prompt_text = chat_prompt.as_ref().map(|p| resolve_prompt(p));
-            chat::run_chat(config, None, prompt_text, chat_max_tokens, effective_json);
+            chat::run_chat(config, None, prompt_text, chat_max_tokens, effective_json, chat_thinking);
         }
         None => {
             // No subcommand: determine mode based on config file
@@ -315,11 +348,11 @@ fn main() {
             if has_chat && !has_test {
                 // chat mode from config
                 let prompt_text = chat_prompt.as_ref().map(|p| resolve_prompt(p));
-                chat::run_chat(config, None, prompt_text, chat_max_tokens, effective_json);
+                chat::run_chat(config, None, prompt_text, chat_max_tokens, effective_json, chat_thinking);
             } else {
                 // default to test mode (includes case where both exist or neither)
                 let ts = time_slice.unwrap_or(config.time_slice_interval);
-                run_tests(config, concurrent, context, max_tokens_test, env_monitor, ts, effective_json, test_prompt);
+                run_tests(config, concurrent, context, max_tokens_test, env_monitor, ts, effective_json, test_prompt, test_thinking);
             }
         }
     }
@@ -349,6 +382,7 @@ fn run_tests(
     time_slice_interval: f64,
     json_output: bool,
     custom_prompt: Option<String>,
+    enable_thinking: bool,
 ) {
     let stop_flag = Arc::new(AtomicBool::new(false));
     let stop_notify = Arc::new(Notify::new());
@@ -411,6 +445,12 @@ fn run_tests(
         println!("{}: {}", lbl_max_tokens, max_tokens);
         println!("{}: {}", lbl_model, model);
         println!("{}: {}", lbl_prompt, custom_prompt.as_deref().unwrap_or(default_label));
+        let (lbl_thinking, thinking_state) = if lang == "zh" {
+            ("思考", if enable_thinking { "开启" } else { "关闭" })
+        } else {
+            ("Thinking", if enable_thinking { "on" } else { "off" })
+        };
+        println!("{}: {}", lbl_thinking, thinking_state);
         println!("{}: {}s\n", lbl_slice, time_slice_interval);
     }
 
@@ -425,6 +465,7 @@ fn run_tests(
         stop_flag,
         stop_notify,
         time_slice_interval,
+        enable_thinking,
         &lang,
         json_output,
     ));

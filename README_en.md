@@ -69,6 +69,7 @@ On first run, if config file doesn't exist:
 | `max_tokens` | Integer | Max tokens to generate |
 | `env_monitor` | Boolean | Whether to output environment info |
 | `time_slice` | Float | Time slice sampling interval |
+| `enable_thinking` | Boolean | Enable/disable thinking (default `false`; sent as `chat_template_kwargs: {"thinking": ..., "enable_thinking": ...}` in the request body (covers both DeepSeek V4 and Qwen3-style templates)) |
 
 #### chat sub-config
 
@@ -76,6 +77,7 @@ On first run, if config file doesn't exist:
 |------------|------|-------------|
 | `max_tokens` | Integer | Max tokens per response |
 | `prompt` | String | Initial prompt |
+| `enable_thinking` | Boolean | Enable/disable thinking (default `false`; sent as `chat_template_kwargs: {"thinking": ..., "enable_thinking": ...}` in the request body (covers both DeepSeek V4 and Qwen3-style templates)) |
 
 ### Config Example
 
@@ -90,10 +92,12 @@ test:
   concurrent: 4
   context: "4096"
   max_tokens: 128
+  enable_thinking: false
 
 chat:
   max_tokens: 1024
   prompt: "You are an assistant"
+  enable_thinking: false
 ```
 
 ## Usage
@@ -129,6 +133,7 @@ llmperf-rs test [OPTIONS]
 | `--model <MODEL>` | `-m` | Config default | Test model |
 | `--env-monitor` | `-e` | `false` | Output environment info |
 | `--time-slice <SECS>` | - | `3.0` | Time slice sampling interval (seconds) |
+| `--thinking` / `--no-thinking` | - | off | Enable/disable thinking (last one wins; overrides config; sent as `chat_template_kwargs: {"thinking": ..., "enable_thinking": ...}`) |
 | `--timeout <SECONDS>` | - | no limit | Request timeout (seconds) |
 | `--json` | - | `false` | Output results in JSON format |
 | `--lang <LANG>` | - | Auto-detect | Output language (zh/en) |
@@ -145,6 +150,9 @@ llmperf-rs test -j 4 -c 1024:1024:4096
 
 # Custom prompt (total prompt length still follows -c; the noise filler automatically subtracts the prompt and fixed overhead)
 llmperf-rs test -j 2 -c 4096 -p "Summarize the text above"
+
+# Enable thinking (off by default; useful for benchmarking Qwen3-style reasoning models)
+llmperf-rs test -j 2 -c 4096 --thinking
 
 # Specify model and API URL (api-key is optional; empty string is used when omitted)
 llmperf-rs test -m qwen-plus --base-url https://api.example.com/v1 --api-key sk-xxx
@@ -175,6 +183,7 @@ llmperf-rs chat [OPTIONS]
 | `--model <MODEL>` | `-m` | Config default | Chat model |
 | `--prompt <TEXT>` | `-p` | - | When given, runs one-shot mode: streams the response then prints throughput stats, no interactive loop. Supports `@filepath` to read from file |
 | `--max-tokens <NUM>` | - | `1024` | Max tokens per response |
+| `--thinking` / `--no-thinking` | - | off | Enable/disable thinking (last one wins; overrides config; toggle anytime with `/think` in interactive mode; sent as `chat_template_kwargs: {"thinking": ..., "enable_thinking": ...}`) |
 | `--json` | - | `false` | One-shot mode: output the result as JSON (no streaming; requires `-p` or config `chat.prompt`) |
 | `--timeout <SECONDS>` | - | no limit | Request timeout (seconds) |
 | `--lang <LANG>` | - | Auto-detect | Output language (zh/en) |
@@ -195,6 +204,9 @@ llmperf-rs chat -p "Explain quantum computing"
 # One-shot mode with JSON output (suitable for scripting)
 llmperf-rs chat -p "Explain quantum computing" --json
 
+# Enable thinking (off by default)
+llmperf-rs chat -p "Explain quantum computing" --thinking
+
 # Read prompt from file
 llmperf-rs chat -p @prompt.txt
 
@@ -205,7 +217,7 @@ llmperf-rs chat -p "hello" --save-config chat.yaml
 llmperf-rs --config chat.yaml
 ```
 
-Chat mode built-in commands: `/clear` clear history, `/exit` exit, `/help` help.
+Chat mode built-in commands: `/clear` clear history, `/exit` exit, `/help` help, `/think` toggle thinking.
 
 ## Output Description
 
